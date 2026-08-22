@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-900: #0a0e14;
+  --bg-800: #0d1117;
+  --bg-700: #151b23;
+  --bg-600: #1c2330;
+  --accent: #10b981;
+  --accent-glow: rgba(16, 185, 129, 0.15);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg-900);
+  color: #e2e8f0;
+  overflow: hidden;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* xterm 终端 */
+.xterm {
+  padding: 12px;
+  height: 100%;
+}
+.xterm-viewport {
+  background-color: transparent !important;
+}
+
+/* 自定义类 */
+@layer components {
+  .btn {
+    @apply px-3 py-1.5 rounded-lg font-medium text-sm transition-all duration-200 inline-flex items-center gap-1.5 cursor-pointer select-none;
+  }
+  .btn-primary {
+    @apply btn bg-accent-500 hover:bg-accent-600 text-white shadow-lg shadow-accent-500/20;
+  }
+  .btn-secondary {
+    @apply btn bg-bg-600 hover:bg-bg-500 text-slate-300 border border-slate-700;
+  }
+  .btn-ghost {
+    @apply btn hover:bg-bg-600 text-slate-400 hover:text-slate-200;
+  }
+  .btn-danger {
+    @apply btn bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20;
+  }
+  .card {
+    @apply bg-bg-800 border border-slate-800 rounded-xl;
+  }
+  .input {
+    @apply w-full bg-bg-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500
+           focus:outline-none focus:border-accent-500/50 focus:ring-1 focus:ring-accent-500/30 transition-all;
+  }
+  .label {
+    @apply text-xs font-medium text-slate-400 mb-1.5 block uppercase tracking-wider;
+  }
+}
+
+/* 连接状态指示器动画 */
+@keyframes ping-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.9); }
+}
+.status-connected {
+  @apply text-accent-400;
+  animation: ping-dot 2s ease-in-out infinite;
+}
+.status-connecting {
+  @apply text-amber-400;
+  animation: ping-dot 1s ease-in-out infinite;
+}
+.status-disconnected {
+  @apply text-slate-500;
+}

@@ -1,0 +1,19 @@
+# 依赖与构建产物
+node_modules/
+dist/
+release/
+.npm-cache/
+
+# 运行时可变数据(含服务器明文密码,后端会自动重建默认文件)
+data/
+
+# 验证脚本与临时数据(含真实服务器凭据,不入库)
+.verify/
+
+# 原始源码归档(含历史凭据;源码已恢复入库,归档仅本地留存)
+allfiles.md
+
+# 杂项
+*.log
+*.tmp
+.DS_Store
