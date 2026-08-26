@@ -57,24 +57,36 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
   // 自连接以来收到的全部终端文本(供「查看完整历史」,不限大小;仅连接时累积)
   const fullContentRef = useRef('')
 
-  // 是否停留在终端视口底部(写入后保持回到底部,避免跳到会话最上方)
+  // 是否停留在终端视口底部(写入后保持回到底部,避免跳到会话最上方)。
+  // 容差 1 行:末行无换行(提示符/光标行)时 xterm 报告的"底部"比实际少 1 行,
+  // 严格比较会把已在底部的会话误判为"不在底部",尺寸变化后不回粘底而"飘"到顶部
   const wasAtBottom = () => {
     const t = termRef.current
     if (!t || !t.buffer.active) return true
-    return t.buffer.active.viewportY + t.rows >= t.buffer.active.length
+    return t.buffer.active.viewportY + t.rows >= t.buffer.active.length - 1
   }
 
-  // 拟合并保持滚动位置:fit() 在某些 xterm 版本会重置 scrollTop 导致界面跳到最上方
+  // 拟合并保持滚动位置:fit() 在部分 xterm 版本会重置 scrollTop,原本在底部则回到底部
   const fitPreserving = () => {
     const atBottom = wasAtBottom()
     try { fitRef.current?.fit() } catch {}
     if (atBottom) termRef.current?.scrollToBottom()
   }
 
-  // 激活时重新拟合(隐藏时容器尺寸为 0,重新显示必须重算行列)
+  // 拟合并无条件定位到最底部(光标处):切回会话/从隐藏恢复时用,隐藏期间滚动
+  // 位置可能已被重置,必须强制回底;补一帧对抗 fit 重排与滚动同步的竞态
+  const fitAndGoBottom = () => {
+    try { fitRef.current?.fit() } catch {}
+    termRef.current?.scrollToBottom()
+    requestAnimationFrame(() => { try { termRef.current?.scrollToBottom() } catch {} })
+  }
+  const fitAndGoBottomRef = useRef(fitAndGoBottom)
+  fitAndGoBottomRef.current = fitAndGoBottom
+
+  // 激活时重新拟合并回到光标处(隐藏时容器尺寸为 0,重新显示必须重算行列)
   useEffect(() => {
     if (!active) return
-    const raf = requestAnimationFrame(fitPreserving)
+    const raf = requestAnimationFrame(() => fitAndGoBottomRef.current())
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active])
@@ -156,10 +168,15 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
 
     // 容器尺寸变化即重算行列(隐藏/面板开合/窗口变化等场景)
     let ro: ResizeObserver | null = null
+    // 从隐藏恢复(尺寸 0→非 0)时无条件回到底部;可见期间的高度变化才保持滚动位置
+    let roHadSize = false
     try {
       ro = new ResizeObserver(() => {
-        if (!el.clientWidth || !el.clientHeight) return
-        fitPreserving()
+        if (!el.clientWidth || !el.clientHeight) { roHadSize = false; return }
+        const becameVisible = !roHadSize
+        roHadSize = true
+        if (becameVisible) fitAndGoBottomRef.current()
+        else fitPreserving()
       })
       ro.observe(el)
     } catch {

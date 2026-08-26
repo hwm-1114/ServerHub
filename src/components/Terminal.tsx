@@ -85,24 +85,39 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
     }
   }
 
-  // 是否停留在终端视口底部(用于在 fit/写入后保持回到底部,避免跳到最上方)
+  // 是否停留在终端视口底部(用于在 fit/写入后保持回到底部,避免跳到会话最上方)。
+  // 容差 1 行:末行无换行(提示符/光标行)时 xterm 报告的"底部"会比实际少 1 行,
+  // 严格比较会把已在底部的会话误判为"不在底部"——随后容器尺寸一变(传输条弹出/
+  // 收起、面板开合、窗口缩放)触发 refit,fit 后不回粘底部,scrollTop 被 xterm
+  // 重置到顶部,表现为"页面莫名其妙飘到最上方"。与滚轮补偿的判断保持一致。
   const wasAtBottom = () => {
     const t = termRef.current
     if (!t || !t.buffer.active) return true
-    return t.buffer.active.viewportY + t.rows >= t.buffer.active.length
+    return t.buffer.active.viewportY + t.rows >= t.buffer.active.length - 1
   }
 
-  // 拟合并保持滚动到底部:fit() 在某些 xterm 版本会重置 scrollTop 导致界面跳到会话最上方。
+  // 拟合并保持滚动位置:fit() 在部分 xterm 版本会重置 scrollTop,原本在底部则回到底部
   const fitPreserving = () => {
     const atBottom = wasAtBottom()
     try { fitRef.current?.fit() } catch {}
     if (atBottom) termRef.current?.scrollToBottom()
   }
 
-  // 激活时重新拟合(隐藏时容器尺寸为 0,重新显示必须重新计算行列)
+  // 拟合并无条件定位到最底部(光标处)。切回会话/从隐藏恢复时用:隐藏期间的
+  // fit 与尺寸变化可能已把滚动位置重置,wasAtBottom 判断不可靠,必须强制回底。
+  // 再补一帧 scrollToBottom,对抗 fit 触发的视口重排与滚动同步之间的竞态。
+  const fitAndGoBottom = () => {
+    try { fitRef.current?.fit() } catch {}
+    termRef.current?.scrollToBottom()
+    requestAnimationFrame(() => { try { termRef.current?.scrollToBottom() } catch {} })
+  }
+  const fitAndGoBottomRef = useRef(fitAndGoBottom)
+  fitAndGoBottomRef.current = fitAndGoBottom
+
+  // 激活时重新拟合并回到光标处(隐藏时容器尺寸为 0,重新显示必须重新计算行列)
   useEffect(() => {
     if (!active) return
-    const raf = requestAnimationFrame(fitPreserving)
+    const raf = requestAnimationFrame(() => fitAndGoBottomRef.current())
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active])
@@ -196,11 +211,17 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
     // 覆盖:隐藏(display:none)/未连接(容器 display:none)/面板展开收起/窗口大小变化
     // 等所有"终端没充满界面/只显示一小格"的场景。
     let ro: ResizeObserver | null = null
+    // 容器从无尺寸(display:none)恢复为可见时,隐藏期间滚动位置可能已被重置——
+    // 此时无条件回到最底部(光标处);可见期间的高度变化(传输条弹出等)才走"保持位置"
+    let roHadSize = false
     try {
       ro = new ResizeObserver(() => {
         // 容器无尺寸(display:none)时 fit() 会是 0,吞掉;有真实尺寸时正常重算
-        if (!el.clientWidth || !el.clientHeight) return
-        fitPreserving()
+        if (!el.clientWidth || !el.clientHeight) { roHadSize = false; return }
+        const becameVisible = !roHadSize
+        roHadSize = true
+        if (becameVisible) fitAndGoBottomRef.current()
+        else fitPreserving()
       })
       ro.observe(el)
     } catch {
