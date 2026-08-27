@@ -8,6 +8,8 @@ import { TransferBar } from './components/TransferBar'
 import { LocalTerminal } from './components/LocalTerminal'
 import { DeviceFilePanel } from './components/DeviceFilePanel'
 import { getTerminalContent } from './lib/TerminalBridge'
+import { SkinPicker } from './components/SkinPicker'
+import { SKIN_STORAGE_KEY, DEFAULT_SKIN } from './lib/skins'
 import { stripAnsi } from './lib/ansi'
 import { Server, ConnectionStatus, Session, LocalFavorite, MAX_SESSIONS_PER_SERVER } from './types'
 import { Terminal as TerminalIcon, FolderTree, Server as ServerIcon, Plus, X, TerminalSquare, Copy, Check, Smartphone } from 'lucide-react'
@@ -60,6 +62,14 @@ function App() {
   const [localDragId, setLocalDragId] = useState<string | null>(null)
   // 已复制路径的本地标签 id(显示 ✓ 反馈)
   const [copiedLocalId, setCopiedLocalId] = useState<string | null>(null)
+  // 动态特效皮肤(纯 CSS 氛围层,不影响功能;选择持久化到 localStorage)
+  const [skin, setSkin] = useState<string>(() => {
+    try { return localStorage.getItem(SKIN_STORAGE_KEY) || DEFAULT_SKIN } catch { return DEFAULT_SKIN }
+  })
+  const [showSkins, setShowSkins] = useState(false)
+  useEffect(() => {
+    try { localStorage.setItem(SKIN_STORAGE_KEY, skin) } catch {}
+  }, [skin])
 
   const fetchServers = useCallback(async () => {
     const res = await fetch('/api/servers')
@@ -464,6 +474,7 @@ function App() {
         selectedServerId={selectedServerId}
         onSelectServer={(id) => { setSelectedServerId(id) }}
         onAddServer={() => { setEditingServer(null); setShowModal(true) }}
+        onOpenSkins={() => setShowSkins(true)}
         onEditServer={(s) => { setEditingServer(s); setShowModal(true) }}
         onDeleteServer={handleDeleteServer}
         onConnect={handleConnect}
@@ -761,6 +772,16 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* 动态特效皮肤:全屏氛围层,pointer-events:none 且低于弹窗层级,零功能影响 */}
+      {skin !== DEFAULT_SKIN && (
+        <div className={`skin-layer skin-${skin}`} aria-hidden>
+          <i /><i /><i /><i />
+        </div>
+      )}
+      {showSkins && (
+        <SkinPicker current={skin} onApply={setSkin} onClose={() => setShowSkins(false)} />
+      )}
 
       {/* 添加/编辑服务器弹窗 */}
       {showModal && (

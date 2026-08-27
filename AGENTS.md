@@ -22,6 +22,8 @@
 
 **功能补齐与增强（2026-08-22 批次 E/F/G 完成，冒烟 24/24）**：文件管理四项（重命名/移动 `POST /files/rename`、递归建目录 `POST /files/mkdir`、在线编辑保存 `PUT /files/content`【不存在即新建，均限 512KB】、递归搜索 `GET /files/search?path=&q=&maxdepth=`【find 按条目名匹配，≤2000 条】）；工程化（`npm test` 一键串跑五脚本、`npm run typecheck`、`npm run lint`【eslint 最小配置，0 error/67 warning 作改进清单】、桌面壳 app:dev 与 NSIS 出包均验证通过）；体验增强（侧栏已连接服务器 30s 健康摘要 load+内存、上传并发度 2 的队列调度、完整历史导出 HTML 保留颜色 `lib/ansiToHtml.ts`、浏览器环境 hdc 上传路径提示）。
 
+**动态特效皮肤（2026-08-27 批次 H，v1.2.0）**：20 款纯 CSS 全屏氛围层皮肤（粒子/光效/氛围三组），侧栏 Logo 行调色板入口（`Sidebar.tsx` onOpenSkins）→ `SkinPicker.tsx` 弹窗（每卡含 `.skin-preview` 迷你实时预览）。实现在 `src/skins.css`（单文件，动画仅 transform/opacity，`@media (prefers-reduced-motion)` 自动关闭）+ `src/lib/skins.ts`（注册表/存储键 `serverhub:skin`）。全屏氛围层 `.skin-layer` 为 `pointer-events:none` 纯装饰层（z-35），**不拦截任何交互、不影响功能**；选择存 localStorage，App.tsx 按 skin!==none 挂载。已浏览器实测：应用/点击穿透/关闭特效/全新加载持久化/界面文字可读。
+
 **桌面版升级数据保留（用户强要求，已实测）**：所有运行数据写在 `%APPDATA%/ServerHub`（Electron userData，`main.cjs` 设 `SERVERHUB_DATA_DIR`），与安装目录完全隔离；NSIS 覆盖安装只替换安装目录文件。已实测"安装→种入服务器/命令数据→覆盖重装→数据完整保留"，且 `deleteAppDataOnUninstall: false` 保证卸载也不删数据。
 
 ## 项目概述

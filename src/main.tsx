@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
+import './skins.css'
 import { initAccessToken, getAccessToken } from './lib/token'
 
 // 首次进入:URL ?token=xxx 带入访问令牌并持久化(见 lib/token.ts)

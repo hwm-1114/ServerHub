@@ -1,5 +1,5 @@
 import { Server, ConnectionStatus, Session, LocalFavorite } from '../types'
-import { Plus, Settings, Trash2, Wifi, WifiOff, Server as ServerIcon, Terminal, Activity, ChevronRight, ChevronDown, TerminalSquare, MoreVertical, FolderKanban, X, Folder, Copy } from 'lucide-react'
+import { Plus, Settings, Trash2, Wifi, WifiOff, Server as ServerIcon, Terminal, Activity, ChevronRight, ChevronDown, TerminalSquare, MoreVertical, FolderKanban, X, Folder, Copy, Palette } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { CommandPanel } from './CommandPanel'
 import { LocalDirBrowser } from './LocalDirBrowser'
@@ -14,6 +14,8 @@ interface Props {
   selectedServerId: string | null
   onSelectServer: (id: string) => void
   onAddServer: () => void
+  /** 打开动态特效皮肤选择器 */
+  onOpenSkins?: () => void
   onEditServer: (s: Server) => void
   onDeleteServer: (id: string) => void
   onConnect: (id: string) => void
@@ -44,7 +46,7 @@ interface Props {
 }
 
 export function Sidebar({
-  servers, statuses, sessions, activeSessionId, selectedServerId,
+  servers, statuses, sessions, activeSessionId, selectedServerId, onOpenSkins,
   onSelectServer, onAddServer, onEditServer, onDeleteServer,
   onConnect, onDisconnect, onSelectSession, onCreateSession,
   onRenameSession, onDeleteSession, busySessions, width,
@@ -114,7 +116,7 @@ export function Sidebar({
 
   return (
     <div className="h-full bg-bg-800 border-r border-slate-800 flex flex-col flex-shrink-0" style={{ width: width ?? 288 }}>
-      {/* Logo */}
+      {/* Logo + 皮肤入口 */}
       <div className="h-12 flex items-center gap-2.5 px-4 border-b border-slate-800">
         <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-accent-400 to-accent-600 flex items-center justify-center shadow-lg shadow-accent-500/20">
           <Terminal size={16} className="text-white" />
@@ -123,6 +125,14 @@ export function Sidebar({
           <div className="text-sm font-bold text-slate-200 leading-tight">ServerHub</div>
           <div className="text-[10px] text-slate-500 leading-tight">Linux 管理工具</div>
         </div>
+        <span className="flex-1" />
+        <button
+          onClick={() => onOpenSkins?.()}
+          className="p-1.5 rounded-lg hover:bg-bg-600 text-slate-500 hover:text-accent-400"
+          title="动态特效皮肤"
+        >
+          <Palette size={15} />
+        </button>
       </div>
 
       {/* 视图切换:远程服务器 / 命令集 / 本地终端 */}
