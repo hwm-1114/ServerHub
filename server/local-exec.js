@@ -28,6 +28,22 @@ export function writeLocalDirs(list) {
   fs.writeFileSync(localDirsFile, JSON.stringify(list, null, 2))
 }
 
+// 事务性"读-改-写":整个读改写按文件互斥排队,防并发请求互相覆盖丢更新
+// (与 ssh-manager 的 mutateJson 同思路)
+let localDirsChain = Promise.resolve()
+export function mutateLocalDirs(fn) {
+  const run = localDirsChain.catch(() => {}).then(async () => {
+    const cur = readLocalDirs()
+    const next = await fn(cur)
+    const tmp = localDirsFile + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2))
+    fs.renameSync(tmp, localDirsFile)
+    return next
+  })
+  localDirsChain = run.then(() => {}, () => {})
+  return run
+}
+
 // ========== 本地 shell 管理 ==========
 const localShells = new Map() // id -> { pty }
 

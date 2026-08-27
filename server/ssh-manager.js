@@ -89,6 +89,23 @@ function writeJson(file, data) {
   return run
 }
 
+// 事务性"读-改-写":整个读改写按文件互斥排队。只串行化写入不够——两个并发
+// 请求同时读到同一份旧列表、各自追加、先后落盘时,后写会把先写的新记录覆盖掉
+// (可靠性矩阵 R10 实测到:并发 40 建会话丢 1 条)。所有变更型路由必须走这里。
+function mutateJson(file, mutator) {
+  const prev = fileChains.get(file) || Promise.resolve()
+  const run = prev.catch(() => {}).then(async () => {
+    const cur = readJson(file)
+    const next = await mutator(cur)
+    const tmp = file + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2))
+    fs.renameSync(tmp, file)
+    return next
+  })
+  fileChains.set(file, run.then(() => {}, () => {}))
+  return run
+}
+
 export function readServers() {
   return readJson(serversFile)
 }
@@ -122,6 +139,12 @@ export function readBookmarks() {
 export function writeBookmarks(bookmarks) {
   return writeJson(bookmarksFile, bookmarks)
 }
+
+// 事务性读改写(供全部变更型路由使用,防并发丢更新)
+export function mutateServers(fn) { return mutateJson(serversFile, fn) }
+export function mutateSessions(fn) { return mutateJson(sessionsFile, fn) }
+export function mutateBookmarks(fn) { return mutateJson(bookmarksFile, fn) }
+export function mutateCommands(fn) { return mutateJson(commandsFile, fn) }
 
 // ========== SSH 连接管理(终端连接池) ==========
 // 原先是 serverId -> 单条 ssh2 连接。但 sshd MaxSessions 默认=10,限制的是"单条连接"上的

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url'
 import {
   readServers, writeServers, readCommands, writeCommands,
   readSessions, writeSessions, readBookmarks, writeBookmarks,
+  mutateServers, mutateSessions, mutateBookmarks, mutateCommands,
   connect, disconnect, getConnectionStatus, getClient,
   createShell, execCommand, listDirectory, readFileContent,
   createUploadStream, deletePath, renamePath, makeDirectory, writeFileContent,
@@ -16,7 +17,7 @@ import {
   ensureFileClient, getFileClient, getFileSftp, retryFileAfterReconnect, disconnectFile,
 } from './ssh-manager.js'
 import {
-  readLocalDirs, writeLocalDirs, createLocalShell, getLocalShell,
+  readLocalDirs, writeLocalDirs, mutateLocalDirs, createLocalShell, getLocalShell,
   destroyLocalShell, resizeLocalShell, getDefaultLocalDir, browseDirectory,
   hdcFileSend, hdcFileRecv, hdcFileList, hdcListTargets, getDeviceState, connectDevice, disconnectDevice,
   getTransferState, saveTransferState, openLocalDir,
@@ -99,12 +100,11 @@ app.get('/api/servers', (req, res) => {
   res.json(servers)
 })
 
-app.post('/api/servers', (req, res) => {
+app.post('/api/servers', async (req, res) => {
   const { name, host, port, username, password } = req.body
   if (!host || !username) {
     return res.status(400).json({ error: '缺少必填字段' })
   }
-  const servers = readServers()
   const newServer = {
     id: `srv-${genIdSuffix()}`,
     name: name || `${host}`,
@@ -114,44 +114,45 @@ app.post('/api/servers', (req, res) => {
     password: password || '',
     createdAt: new Date().toISOString(),
   }
-  servers.push(newServer)
-  writeServers(servers)
+  await mutateServers(list => { list.push(newServer); return list })
   res.status(201).json(newServer)
 })
 
-app.put('/api/servers/:id', (req, res) => {
+app.put('/api/servers/:id', async (req, res) => {
   const { id } = req.params
-  const servers = readServers()
-  const idx = servers.findIndex(s => s.id === id)
-  if (idx === -1) return res.status(404).json({ error: '服务器不存在' })
-
-  const updated = { ...servers[idx] }
   const { name, host, port, username, password } = req.body
-  if (name !== undefined) updated.name = name
-  if (host !== undefined) updated.host = host
-  if (port !== undefined) updated.port = port
-  if (username !== undefined) updated.username = username
-  // 密码明文直接写入(本地/内网工具,刻意设计)
-  if (password !== undefined) {
-    updated.password = password
+  try {
+    await mutateServers(list => {
+      const idx = list.findIndex(s => s.id === id)
+      if (idx === -1) throw Object.assign(new Error('服务器不存在'), { statusCode: 404 })
+      const u = { ...list[idx] }
+      if (name !== undefined) u.name = name
+      if (host !== undefined) u.host = host
+      if (port !== undefined) u.port = port
+      if (username !== undefined) u.username = username
+      // 密码明文直接写入(本地/内网工具,刻意设计)
+      if (password !== undefined) u.password = password
+      list[idx] = u
+      return list
+    })
+    const updated = readServers().find(x => x.id === id)
+    res.json(updated)
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
-  servers[idx] = updated
-  writeServers(servers)
-  res.json(updated)
 })
 
-app.delete('/api/servers/:id', (req, res) => {
+app.delete('/api/servers/:id', async (req, res) => {
   const { id } = req.params
   disconnect(id)
   disconnectFile(id) // 文件连接一并断开,避免残留
-  const servers = readServers()
-  const filtered = servers.filter(s => s.id !== id)
-  writeServers(filtered)
+  await mutateServers(list => list.filter(s => s.id !== id))
   // 同时清理该服务器的会话记录与路径收藏(功能文档声明的行为;不清理会持续累积孤儿数据)
-  const removedSessions = readSessions().filter(s => s.serverId === id)
-  removedSessions.forEach(s => pendingInitialDir.delete(s.id)) // 待注入的初始目录一并清理,防泄漏
-  writeSessions(readSessions().filter(s => s.serverId !== id))
-  writeBookmarks(readBookmarks().filter(b => b.serverId !== id))
+  await mutateSessions(list => list.filter(s => {
+    if (s.serverId === id) { pendingInitialDir.delete(s.id); return false } // 待注入目录一并清理,防泄漏
+    return true
+  }))
+  await mutateBookmarks(list => list.filter(b => b.serverId !== id))
   res.json({ success: true })
 })
 
@@ -471,32 +472,29 @@ app.get('/api/servers/:id/bookmarks', (req, res) => {
   res.json(bookmarks)
 })
 
-app.post('/api/servers/:id/bookmarks', (req, res) => {
+app.post('/api/servers/:id/bookmarks', async (req, res) => {
   const serverId = req.params.id
   if (!req.body || !req.body.path) return res.status(400).json({ error: '缺少 path 参数' })
-  const bookmarks = readBookmarks()
   const path = String(req.body.path)
-  // 去重:同一服务器同一路径只留一个
-  const existing = bookmarks.find(b => b.serverId === serverId && b.path === path)
-  if (existing) return res.status(200).json(existing)
-  const name = String(req.body.name || '').trim() || path.split('/').filter(Boolean).pop() || path
+  const mkName = () => String(req.body.name || '').trim() || path.split('/').filter(Boolean).pop() || path
   const bk = {
     id: `bm-${genIdSuffix()}`,
     serverId,
     path,
-    name,
+    name: mkName(),
     createdAt: new Date().toISOString(),
   }
-  bookmarks.push(bk)
-  writeBookmarks(bookmarks)
-  res.status(201).json(bk)
+  // 去重:同一服务器同一路径只留一个(事务内判定,防并发重复)
+  const saved = await mutateBookmarks(list => {
+    const existing = list.find(b => b.serverId === serverId && b.path === path)
+    return existing ? list : (list.push(bk), list)
+  }).then(list => list.find(b => b.serverId === serverId && b.path === path))
+  res.status(saved.id === bk.id ? 201 : 200).json(saved)
 })
 
-app.delete('/api/servers/:id/bookmarks/:bid', (req, res) => {
+app.delete('/api/servers/:id/bookmarks/:bid', async (req, res) => {
   const { id, bid } = req.params
-  const bookmarks = readBookmarks()
-  const filtered = bookmarks.filter(b => !(b.id === bid && b.serverId === id))
-  writeBookmarks(filtered)
+  await mutateBookmarks(list => list.filter(b => !(b.id === bid && b.serverId === id)))
   res.json({ success: true })
 })
 
@@ -524,10 +522,9 @@ app.get('/api/commands', (req, res) => {
   res.json(commands)
 })
 
-app.post('/api/commands', (req, res) => {
+app.post('/api/commands', async (req, res) => {
   const { name, command, category, description } = req.body
   if (!name || !command) return res.status(400).json({ error: '缺少必填字段' })
-  const commands = readCommands()
   const newCmd = {
     id: `cmd-${genIdSuffix()}`,
     name,
@@ -543,65 +540,68 @@ app.post('/api/commands', (req, res) => {
   if (req.body.scope === 'local') newCmd.scope = 'local'
   // 执行方式:false=手动(仅敲入命令,用户按回车执行);缺省/true=直接执行
   if (req.body.autoRun !== undefined) newCmd.autoRun = !!req.body.autoRun
-  commands.push(newCmd)
-  writeCommands(commands)
+  await mutateCommands(list => { list.push(newCmd); return list })
   res.status(201).json(newCmd)
 })
 
-app.put('/api/commands/:id', (req, res) => {
+app.put('/api/commands/:id', async (req, res) => {
   const { id } = req.params
-  const commands = readCommands()
-  const idx = commands.findIndex(c => c.id === id)
-  if (idx === -1) return res.status(404).json({ error: '命令不存在' })
   const { name, command, category, description } = req.body
-  if (name !== undefined) commands[idx].name = name
-  if (command !== undefined) commands[idx].command = command
-  if (category !== undefined) commands[idx].category = category
-  if (description !== undefined) commands[idx].description = description
-  if (req.body.autoRun !== undefined) commands[idx].autoRun = !!req.body.autoRun
-  // 命令集:scope='local' 为本地终端命令;缺省/删除时清理成远程命令集
-  if (req.body.scope !== undefined) {
-    if (req.body.scope === 'local') commands[idx].scope = 'local'
-    else delete commands[idx].scope
+  try {
+    const updated = await mutateCommands(list => {
+      const idx = list.findIndex(c => c.id === id)
+      if (idx === -1) throw Object.assign(new Error('命令不存在'), { statusCode: 404 })
+      if (name !== undefined) list[idx].name = name
+      if (command !== undefined) list[idx].command = command
+      if (category !== undefined) list[idx].category = category
+      if (description !== undefined) list[idx].description = description
+      if (req.body.autoRun !== undefined) list[idx].autoRun = !!req.body.autoRun
+      // 命令集:scope='local' 为本地终端命令;缺省/删除时清理成远程命令集
+      if (req.body.scope !== undefined) {
+        if (req.body.scope === 'local') list[idx].scope = 'local'
+        else delete list[idx].scope
+      }
+      // 归属:serverId 缺省/null/'common' → 公共(不写该字段,以便旧数据兼容)
+      if (req.body.serverId !== undefined) {
+        if (req.body.serverId && req.body.serverId !== 'common') {
+          list[idx].serverId = req.body.serverId
+        } else {
+          delete list[idx].serverId
+        }
+      }
+      return list
+    }).then(list => list.find(c => c.id === id))
+    res.json(updated)
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
-  // 归属:serverId 缺省/null/'common' → 公共(不写该字段,以便旧数据兼容)
-  if (req.body.serverId !== undefined) {
-    if (req.body.serverId && req.body.serverId !== 'common') {
-      commands[idx].serverId = req.body.serverId
-    } else {
-      delete commands[idx].serverId
-    }
-  }
-  writeCommands(commands)
-  res.json(commands[idx])
 })
 
-app.delete('/api/commands/:id', (req, res) => {
-  const commands = readCommands()
-  const filtered = commands.filter(c => c.id !== req.params.id)
-  writeCommands(filtered)
+app.delete('/api/commands/:id', async (req, res) => {
+  await mutateCommands(list => list.filter(c => c.id !== req.params.id))
   res.json({ success: true })
 })
 
 // 调整命令顺序:按传入的 ids 顺序重排整份命令数组(用于同命令集内拖拽排序)
-app.post('/api/commands/order', (req, res) => {
+app.post('/api/commands/order', async (req, res) => {
   const { ids } = req.body
   if (!Array.isArray(ids)) return res.status(400).json({ error: '缺少 ids' })
-  const commands = readCommands()
-  const byId = new Map(commands.map(c => [c.id, c]))
-  const used = new Set()
-  const result = []
-  for (const id of ids) {
-    if (byId.has(id) && !used.has(id)) { result.push(byId.get(id)); used.add(id) }
-  }
-  // 未出现在 ids 里的命令保持原有相对顺序,附加到末尾
-  for (const c of commands) if (!used.has(c.id)) result.push(c)
-  writeCommands(result)
+  const result = await mutateCommands(list => {
+    const byId = new Map(list.map(c => [c.id, c]))
+    const used = new Set()
+    const out = []
+    for (const id of ids) {
+      if (byId.has(id) && !used.has(id)) { out.push(byId.get(id)); used.add(id) }
+    }
+    // 未出现在 ids 里的命令保持原有相对顺序,附加到末尾
+    for (const c of list) if (!used.has(c.id)) out.push(c)
+    return out
+  })
   res.json(result)
 })
 
 // 覆盖导入命令:整体替换命令列表(用于从 .txt 导回)
-app.post('/api/commands/import', (req, res) => {
+app.post('/api/commands/import', async (req, res) => {
   const list = Array.isArray(req.body) ? req.body : (Array.isArray(req.body && req.body.commands) ? req.body.commands : null)
   if (!list) return res.status(400).json({ error: '格式不正确:需要命令数组' })
   const now = Date.now()
@@ -620,7 +620,7 @@ app.post('/api/commands/import', (req, res) => {
   })
   // 非法条目(缺名称或命令)直接滤掉,避免导入后全是空命令
   const valid = normalized.filter(c => c.name && c.command)
-  writeCommands(valid)
+  await mutateCommands(() => valid)
   res.json({ success: true, count: valid.length })
 })
 
@@ -630,91 +630,100 @@ app.get('/api/servers/:id/sessions', (req, res) => {
   res.json(sessions)
 })
 
-app.post('/api/servers/:id/sessions', (req, res) => {
+app.post('/api/servers/:id/sessions', async (req, res) => {
   const serverId = req.params.id
   // 校验服务器存在
-  const servers = readServers()
-  if (!servers.find(s => s.id === serverId)) {
+  if (!readServers().find(s => s.id === serverId)) {
     return res.status(404).json({ error: '服务器不存在' })
   }
-  const sessions = readSessions()
-  const serverSessions = sessions.filter(s => s.serverId === serverId)
-  if (serverSessions.length >= MAX_SESSIONS_PER_SERVER) {
-    return res.status(400).json({ error: `每台服务器最多 ${MAX_SESSIONS_PER_SERVER} 个会话(${MAX_SESSIONS_PER_SERVER} 个),请先关闭部分会话` })
+  try {
+    // 上限校验放进同一事务:并发创建时不会两个请求都读到"19 条"而双双通过。
+    // mutator 的返回值即落盘内容,必须是数组;新会话对象经闭包带出
+    let newSession = null
+    await mutateSessions(list => {
+      const serverSessions = list.filter(s => s.serverId === serverId)
+      if (serverSessions.length >= MAX_SESSIONS_PER_SERVER) {
+        throw Object.assign(new Error(`每台服务器最多 ${MAX_SESSIONS_PER_SERVER} 个会话(${MAX_SESSIONS_PER_SERVER} 个),请先关闭部分会话`), { statusCode: 400 })
+      }
+      newSession = {
+        id: `ses-${genIdSuffix()}`,
+        serverId,
+        name: req.body.name || `会话 ${serverSessions.length + 1}`,
+        createdAt: new Date().toISOString(),
+      }
+      list.push(newSession)
+      return list
+    })
+    // 可选 dir:在指定目录打开远程会话(文件界面「在当前目录打开会话」)
+    // 复用 duplicate 的初始终端目录机制 → 该会话 WS 建 shell 后自动 cd 到 dir
+    if (req.body.dir && newSession) pendingInitialDir.set(newSession.id, req.body.dir)
+    res.status(201).json(newSession)
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
-  const newSession = {
-    id: `ses-${genIdSuffix()}`,
-    serverId,
-    name: req.body.name || `会话 ${serverSessions.length + 1}`,
-    createdAt: new Date().toISOString(),
-  }
-  sessions.push(newSession)
-  writeSessions(sessions)
-  // 可选 dir:在指定目录打开远程会话(文件界面「在当前目录打开会话」)
-  // 复用 duplicate 的初始终端目录机制 → 该会话 WS 建 shell 后自动 cd 到 dir
-  if (req.body.dir) pendingInitialDir.set(newSession.id, req.body.dir)
-  res.status(201).json(newSession)
 })
 
-app.put('/api/servers/:id/sessions/:sessionId', (req, res) => {
+app.put('/api/servers/:id/sessions/:sessionId', async (req, res) => {
   const { id, sessionId } = req.params
-  const sessions = readSessions()
-  const idx = sessions.findIndex(s => s.id === sessionId && s.serverId === id)
-  if (idx === -1) return res.status(404).json({ error: '会话不存在' })
-  if (req.body.name !== undefined) sessions[idx].name = req.body.name
-  writeSessions(sessions)
-  res.json(sessions[idx])
+  try {
+    const updated = await mutateSessions(list => {
+      const idx = list.findIndex(s => s.id === sessionId && s.serverId === id)
+      if (idx === -1) throw Object.assign(new Error('会话不存在'), { statusCode: 404 })
+      if (req.body.name !== undefined) list[idx].name = req.body.name
+      return list
+    }).then(list => list.find(x => x.id === sessionId))
+    res.json(updated)
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
+  }
 })
 
-app.delete('/api/servers/:id/sessions/:sessionId', (req, res) => {
+app.delete('/api/servers/:id/sessions/:sessionId', async (req, res) => {
   const { id, sessionId } = req.params
   // 关闭可能仍在线的对应 shell,释放远端 session
   destroyShell(id, sessionId)
   pendingInitialDir.delete(sessionId) // 会话从未连 WS 时清掉待注入目录,防泄漏
-  const sessions = readSessions()
-  const filtered = sessions.filter(s => !(s.id === sessionId && s.serverId === id))
-  writeSessions(filtered)
+  await mutateSessions(list => list.filter(s => !(s.id === sessionId && s.serverId === id)))
   res.json({ success: true })
 })
 
 // 调整会话顺序:按传入的该服务器 ids 顺序重排该服务器会话(用于同服务器会话拖拽排序)
-app.post('/api/servers/:id/sessions/order', (req, res) => {
+app.post('/api/servers/:id/sessions/order', async (req, res) => {
   const serverId = req.params.id
   const { ids } = req.body
   if (!Array.isArray(ids)) return res.status(400).json({ error: '缺少 ids' })
-  const sessions = readSessions()
-  const serverSessions = sessions.filter(s => s.serverId === serverId)
-  const byId = new Map(serverSessions.map(s => [s.id, s]))
-  const used = new Set()
-  const reordered = []
-  for (const id of ids) {
-    if (byId.has(id) && !used.has(id)) { reordered.push(byId.get(id)); used.add(id) }
-  }
-  for (const s of serverSessions) if (!used.has(s.id)) reordered.push(s)
-  // 重建整份数组:该服务器的会话按新顺序,其他服务器的会话保持原有位置
-  const result = []
-  let inserted = false
-  for (const s of sessions) {
-    if (s.serverId === serverId) {
-      if (!inserted) { result.push(...reordered); inserted = true }
-    } else {
-      result.push(s)
+  let reordered = null
+  await mutateSessions(list => {
+    const serverSessions = list.filter(s => s.serverId === serverId)
+    const byId = new Map(serverSessions.map(s => [s.id, s]))
+    const used = new Set()
+    const ro = []
+    for (const id of ids) {
+      if (byId.has(id) && !used.has(id)) { ro.push(byId.get(id)); used.add(id) }
     }
-  }
-  if (!inserted) result.push(...reordered)
-  writeSessions(result)
+    for (const s of serverSessions) if (!used.has(s.id)) ro.push(s)
+    // 重建整份数组:该服务器的会话按新顺序,其他服务器的会话保持原有位置
+    const result = []
+    let inserted = false
+    for (const s of list) {
+      if (s.serverId === serverId) {
+        if (!inserted) { result.push(...ro); inserted = true }
+      } else {
+        result.push(s)
+      }
+    }
+    if (!inserted) result.push(...ro)
+    reordered = ro // 闭包带出响应用的新顺序
+    return result // 落盘的必须是数组
+  })
   res.json(reordered)
 })
 
 // 复制会话:新会话沿用原名称,并尽量保持相同的当前工作目录
 app.post('/api/servers/:id/sessions/:sessionId/duplicate', async (req, res) => {
   const { id, sessionId } = req.params
-  const sessions = readSessions()
-  const orig = sessions.find(s => s.id === sessionId && s.serverId === id)
+  const orig = readSessions().find(s => s.id === sessionId && s.serverId === id)
   if (!orig) return res.status(404).json({ error: '会话不存在' })
-  if (sessions.filter(s => s.serverId === id).length >= MAX_SESSIONS_PER_SERVER) {
-    return res.status(400).json({ error: `每台服务器最多 ${MAX_SESSIONS_PER_SERVER} 个会话,请先关闭部分会话` })
-  }
 
   // 确保已连接(复制会话需要操作已有 shell)
   if (!getClient(id)) {
@@ -725,17 +734,28 @@ app.post('/api/servers/:id/sessions/:sessionId/duplicate', async (req, res) => {
   let cwd = null
   try { cwd = await captureShellCwd(id, sessionId) } catch { cwd = null }
 
-  const newSession = {
-    id: `ses-${genIdSuffix()}`,
-    serverId: id,
-    // 名称与原会话保持一致
-    name: orig.name,
-    createdAt: new Date().toISOString(),
+  // 上限校验入事务(并发复制/创建不会双双通过);新会话对象经闭包带出
+  try {
+    let newSession = null
+    await mutateSessions(list => {
+      if (list.filter(s => s.serverId === id).length >= MAX_SESSIONS_PER_SERVER) {
+        throw Object.assign(new Error(`每台服务器最多 ${MAX_SESSIONS_PER_SERVER} 个会话,请先关闭部分会话`), { statusCode: 400 })
+      }
+      newSession = {
+        id: `ses-${genIdSuffix()}`,
+        serverId: id,
+        // 名称与原会话保持一致
+        name: orig.name,
+        createdAt: new Date().toISOString(),
+      }
+      list.push(newSession)
+      return list
+    })
+    if (cwd && newSession) pendingInitialDir.set(newSession.id, cwd)
+    res.status(201).json(newSession)
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ error: err.message })
   }
-  sessions.push(newSession)
-  writeSessions(sessions)
-  if (cwd) pendingInitialDir.set(newSession.id, cwd)
-  res.status(201).json(newSession)
 })
 
 // 获取某会话 shell 的当前工作目录(文件界面「在当前目录打开文件」用)
@@ -771,21 +791,20 @@ app.get('/api/local/favorites', (req, res) => {
   res.json(readLocalDirs())
 })
 
-app.post('/api/local/favorites', (req, res) => {
+app.post('/api/local/favorites', async (req, res) => {
   const p = String((req.body && req.body.path) || '').trim()
   if (!p) return res.status(400).json({ error: '缺少 path' })
-  const list = readLocalDirs()
-  const existing = list.find((f) => f.path === p)
-  if (existing) return res.status(200).json(existing)
   const fav = { id: `lfd-${genIdSuffix()}`, path: p, name: (req.body && req.body.name) || p }
-  list.push(fav)
-  writeLocalDirs(list)
-  res.status(201).json(fav)
+  // 去重判定入事务,防并发重复收藏
+  const saved = await mutateLocalDirs(list => {
+    const existing = list.find((f) => f.path === p)
+    return existing ? list : (list.push(fav), list)
+  }).then(list => list.find((f) => f.path === p))
+  res.status(saved.id === fav.id ? 201 : 200).json(saved)
 })
 
-app.delete('/api/local/favorites/:id', (req, res) => {
-  const list = readLocalDirs().filter((f) => f.id !== req.params.id)
-  writeLocalDirs(list)
+app.delete('/api/local/favorites/:id', async (req, res) => {
+  await mutateLocalDirs(list => list.filter((f) => f.id !== req.params.id))
   res.json({ success: true })
 })
 

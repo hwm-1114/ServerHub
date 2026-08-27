@@ -19,7 +19,7 @@
     "rebuild": "npm run build && electron-builder --dir",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src server scripts",
-    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs && node scripts/verify-fullhistory.mjs"
+    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs && node scripts/verify-fullhistory.mjs && node scripts/stress-reliability-matrix.mjs"
   },
   "build": {
     "appId": "com.serverhub.app",
