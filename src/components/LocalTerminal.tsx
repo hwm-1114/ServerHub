@@ -56,6 +56,8 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
   activeRef.current = active
   // 自连接以来收到的全部终端文本(供「查看完整历史」,不限大小;仅连接时累积)
   const fullContentRef = useRef('')
+  // 原始字节块(完整历史重建视图回放用),含退出全屏前的抓屏快照
+  const fullBytesRef = useRef<Uint8Array[]>([])
 
   // 是否停留在终端视口底部(写入后保持回到底部,避免跳到会话最上方)。
   // 容差 1 行:末行无换行(提示符/光标行)时 xterm 报告的"底部"比实际少 1 行,
@@ -166,6 +168,32 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
     }
     el.addEventListener('wheel', onWheel, { passive: true })
 
+    // ===== 全屏(备用屏幕)内容快照(与 Terminal.tsx 相同机制) =====
+    // TUI 程序(vim/htop 等)退出备用屏幕前抓整屏存入历史流,完整历史可见
+    const snapshotAltScreen = () => {
+      try {
+        const buf = term.buffer
+        if (buf.active !== buf.alternate) return
+        const b = buf.alternate
+        const altLines: string[] = []
+        for (let i = 0; i < b.length; i++) altLines.push(b.getLine(i)?.translateToString(true) ?? '')
+        const content = altLines.join('\n').replace(/\s+$/, '')
+        if (!content.trim()) return
+        const journal = `\r\n\x1b[90m──── 全屏模式输出(退出时快照) ────\x1b[0m\r\n${content}\r\n\x1b[90m──── 全屏输出结束 ────\x1b[0m\r\n`
+        fullBytesRef.current.push(new TextEncoder().encode(journal))
+        fullContentRef.current += `\n──── 全屏模式输出(退出时快照) ────\n${content}\n──── 全屏输出结束 ────\n`
+      } catch { /* 抓屏失败不影响终端正常工作 */ }
+    }
+    // xterm 的 CSI 钩子按 prefix+final 匹配(区分不了 h/l),params 在回调里自查
+    const onDecPrivateMode = (params: (number | number[])[]) => {
+      if (params.length === 1 && (params[0] === 1049 || params[0] === 1047 || params[0] === 47)) {
+        snapshotAltScreen()
+      }
+      return false
+    }
+    const altScreenDisposables = ['h', 'l'].map((f) =>
+      term.parser.registerCsiHandler({ prefix: '?', final: f }, onDecPrivateMode))
+
     // 容器尺寸变化即重算行列(隐藏/面板开合/窗口变化等场景)
     let ro: ResizeObserver | null = null
     // 从隐藏恢复(尺寸 0→非 0)时无条件回到底部;可见期间的高度变化才保持滚动位置
@@ -184,6 +212,7 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
     }
 
     return () => {
+      altScreenDisposables.forEach(d => d.dispose())
       ro?.disconnect()
       el.removeEventListener('contextmenu', onContextMenu)
       el.removeEventListener('wheel', onWheel)
@@ -242,10 +271,12 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
           registerTerminalExporter(id, () => fullContentRef.current)
           registerTerminalFocus(id, () => { termRef.current?.focus() })
           fullContentRef.current = ''
+          fullBytesRef.current = []
         } else if (msg.type === 'data') {
           // 还原成 UTF-8 字节再写入,避免多字节字符乱码
           const bytes = decodeBase64ToBytes(msg.data)
           fullContentRef.current += new TextDecoder().decode(bytes)
+          fullBytesRef.current.push(bytes) // 原始字节留档,供完整历史重建视图回放
           const atBottom = wasAtBottom()
           termRef.current?.write(bytes)
           if (atBottom) termRef.current?.scrollToBottom()
@@ -356,6 +387,17 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
         <FullHistoryViewer
           title={`${name || id} · 完整历史`}
           text={fullContentRef.current}
+          getRaw={() => {
+            const chunks = fullBytesRef.current
+            if (!chunks.length) return null
+            let total = 0
+            for (const c of chunks) total += c.length
+            const out = new Uint8Array(total)
+            let off = 0
+            for (const c of chunks) { out.set(c, off); off += c.length }
+            return out
+          }}
+          cols={termRef.current?.cols}
           onClose={() => setShowHistory(false)}
         />
       )}

@@ -1,6 +1,6 @@
 {
   "name": "server-manager",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Linux 服务器管理 Web 工具",
   "type": "module",
   "main": "electron/main.cjs",
@@ -19,7 +19,7 @@
     "rebuild": "npm run build && electron-builder --dir",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src server scripts",
-    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs"
+    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs && node scripts/verify-fullhistory.mjs"
   },
   "build": {
     "appId": "com.serverhub.app",
@@ -83,6 +83,7 @@
     "@types/react-dom": "^18.3.5",
     "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.3.4",
+    "@xterm/headless": "^6.0.0",
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",

@@ -57,6 +57,9 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
   activeRef.current = active
   // 自连接以来收到的全部终端文本(用于导出 txt,不限大小;仅连接时累积)
   const fullContentRef = useRef('')
+  // 自连接以来收到的原始字节块(查看完整历史的"重建视图"回放用;TUI 程序输出
+  // 只有经过终端状态机回放才能还原成可读内容)。含退出全屏前的抓屏快照。
+  const fullBytesRef = useRef<Uint8Array[]>([])
 
   const showToast = (text: string, kind: 'ok' | 'warn' = 'ok') => {
     setToast({ text, kind })
@@ -210,6 +213,35 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
     // 用 ResizeObserver 监听容器尺寸变化,尺寸一变就重算行列。
     // 覆盖:隐藏(display:none)/未连接(容器 display:none)/面板展开收起/窗口大小变化
     // 等所有"终端没充满界面/只显示一小格"的场景。
+    // ===== 全屏(备用屏幕)内容快照 =====
+    // vim/htop/部分 AI agent(claude 等)切到备用屏幕绘制,退出时恢复主屏,其内容会
+    // 从终端消失(实时终端与完整历史都看不到)。在"切回主屏"指令被处理前抓取整屏
+    // 存入历史流,完整历史的重建视图/导出即可包含这部分内容。
+    const snapshotAltScreen = () => {
+      try {
+        const buf = term.buffer
+        if (buf.active !== buf.alternate) return // 只在"即将离开备用屏"时抓
+        const b = buf.alternate
+        const altLines: string[] = []
+        for (let i = 0; i < b.length; i++) altLines.push(b.getLine(i)?.translateToString(true) ?? '')
+        const content = altLines.join('\n').replace(/\s+$/, '')
+        if (!content.trim()) return
+        const journal = `\r\n\x1b[90m──── 全屏模式输出(退出时快照) ────\x1b[0m\r\n${content}\r\n\x1b[90m──── 全屏输出结束 ────\x1b[0m\r\n`
+        fullBytesRef.current.push(new TextEncoder().encode(journal))
+        fullContentRef.current += `\n──── 全屏模式输出(退出时快照) ────\n${content}\n──── 全屏输出结束 ────\n`
+      } catch { /* 抓屏失败不影响终端正常工作 */ }
+    }
+    // xterm 的 CSI 钩子按 prefix+final 匹配(区分不了 h/l),params 在回调里自查;
+    // 其余 DEC 私有模式(光标显隐等)也会走到这里,先用 params 短路保证开销可忽略
+    const onDecPrivateMode = (params: (number | number[])[]) => {
+      if (params.length === 1 && (params[0] === 1049 || params[0] === 1047 || params[0] === 47)) {
+        snapshotAltScreen() // 仅当当前在备用屏(即将退出)时才会真正抓屏
+      }
+      return false // 不拦截,照常由 xterm 处理切换
+    }
+    const altScreenDisposables = ['h', 'l'].map((f) =>
+      term.parser.registerCsiHandler({ prefix: '?', final: f }, onDecPrivateMode))
+
     let ro: ResizeObserver | null = null
     // 容器从无尺寸(display:none)恢复为可见时,隐藏期间滚动位置可能已被重置——
     // 此时无条件回到最底部(光标处);可见期间的高度变化(传输条弹出等)才走"保持位置"
@@ -230,6 +262,7 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
     }
 
     return () => {
+      altScreenDisposables.forEach(d => d.dispose())
       ro?.disconnect()
       el.removeEventListener('contextmenu', onContextMenu)
       el.removeEventListener('wheel', onWheel)
@@ -257,6 +290,7 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
       unregisterTerminalExporter(session.id)
       unregisterTerminalFocus(session.id)
       fullContentRef.current = ''
+      fullBytesRef.current = []
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -313,10 +347,12 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
           registerTerminalExporter(session.id, () => fullContentRef.current)
           registerTerminalFocus(session.id, () => { termRef.current?.focus() })
           fullContentRef.current = ''
+          fullBytesRef.current = []
         } else if (msg.type === 'data') {
           // 还原成 UTF-8 字节再写入,避免多字节字符(边框符等)乱码
           const bytes = decodeBase64ToBytes(msg.data)
           fullContentRef.current += new TextDecoder().decode(bytes) // 累积全部输出,导出不限大小
+          fullBytesRef.current.push(bytes) // 原始字节留档,供完整历史重建视图回放
           const atBottom = wasAtBottom()
           termRef.current?.write(bytes)
           // 若原本停留在底部,写入后保持回到底部,避免回车/输出把界面跳到会话最上方
@@ -466,6 +502,17 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
         <FullHistoryViewer
           title={`${session.name || session.id} · 完整历史`}
           text={fullContentRef.current}
+          getRaw={() => {
+            const chunks = fullBytesRef.current
+            if (!chunks.length) return null
+            let total = 0
+            for (const c of chunks) total += c.length
+            const out = new Uint8Array(total)
+            let off = 0
+            for (const c of chunks) { out.set(c, off); off += c.length }
+            return out
+          }}
+          cols={termRef.current?.cols}
           onClose={() => setShowHistory(false)}
         />
       )}
