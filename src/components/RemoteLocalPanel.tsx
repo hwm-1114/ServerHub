@@ -12,6 +12,8 @@ interface Props {
   remoteDir?: string
   /** 本地浏览路径上报给父组件(批量下载到本机时用) */
   onPathChange?: (p: string) => void
+  /** 变化时刷新本机目录列表(父组件批量下载完成后通知) */
+  refreshSignal?: number
 }
 
 interface Entry { name: string; isDir: boolean; size?: number }
@@ -44,7 +46,7 @@ function joinPath(parent: string, child: string): string {
 // FileBrowser 左侧的本机(Windows)目录面板:
 // - 本机文件可拖到右侧远程文件列表=上传(读本机→SFTP 写远端);
 // - 也是远程文件拖入的目标=下载(SFTP 读→写本机);可收藏本机目录。
-export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: Props) {
+export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, refreshSignal }: Props) {
   const [browsePath, setBrowsePathState] = useState('')
   // 切换目录时既更新本地状态,也上报给父组件(批量下载到本机时用)
   const setBrowsePath = useCallback((p: string) => {
@@ -84,13 +86,17 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: P
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   useEffect(() => { fetchBrowse(browsePath) }, [browsePath, fetchBrowse])
+  // 父组件批量下载完成后的刷新通知:只看 refreshSignal 变化,browsePath 取闭包当前值
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (refreshSignal) fetchBrowse(browsePath) }, [refreshSignal])
 
-  // 批量上传选中到远程当前目录
+  // 批量上传选中到远程当前目录(串行,聚合每文件失败原因)
   const uploadSelected = async () => {
     const files = Array.from(selected)
     if (files.length === 0 || !remoteDir) { showToast('请选择文件,且需先进入远程目录', 'warn'); return }
     setUploading(true)
     let ok = 0
+    const fails: string[] = []
     for (const p of files) {
       const name = p.split(/[\\/]/).filter(Boolean).pop() || ''
       try {
@@ -98,14 +104,17 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: P
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ localPath: p, remoteDir }),
         })
-        const d = await r.json()
-        if (r.ok && !d.error) ok++
-      } catch {}
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+        ok++
+      } catch (err) {
+        fails.push(`${name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
     }
     setUploading(false)
     setSelected(new Set())
     setSelectMode(false)
-    showToast(`已上传 ${ok}/${files.length} 个文件到 ${remoteDir}`)
+    reportBatch('已上传', ok, files.length, fails, remoteDir)
   }
 
   // 切换单个文件选中,并更新 shift 锚点
@@ -170,41 +179,81 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: P
     }
   }
 
-  // 下载:远程文件 → 本机目录
-  const doRemoteToLocal = async (remotePath: string, name: string, targetDir: string) => {
-    setBusy(true)
+  // 核心:单个 远程→本机 传输,返回错误文本而不直接弹提示(单次与批量共用)
+  const transferRemoteToLocal = async (remotePath: string, targetDir: string): Promise<string | null> => {
     try {
       const r = await fetch(`/api/servers/${serverId}/files/remote-to-local`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ remotePath, localDir: targetDir }),
       })
-      const d = await r.json()
-      if (!r.ok) throw new Error(d.error || '下载失败')
-      showToast(`已下载 ${name} → ${targetDir}`)
-      fetchBrowse(browsePath)
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+      return null
     } catch (err) {
-      showToast(`下载失败: ${err instanceof Error ? err.message : '未知错误'}`, 'warn')
-    } finally { setBusy(false) }
+      return err instanceof Error ? err.message : '未知错误'
+    }
+  }
+
+  // 批量结果汇总:成功整批报喜;有失败列出前几条原因(旧实现 catch{} 丢弃原因,只报 N/M)
+  const reportBatch = (verb: string, ok: number, total: number, fails: string[], target: string) => {
+    if (fails.length === 0) { showToast(`${verb} ${ok}/${total} 个文件 → ${target}`); return }
+    const head = fails.slice(0, 2).join('；')
+    showToast(`${verb} ${ok}/${total} 个文件,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`, 'warn')
+  }
+
+  // 下载:远程文件 → 本机目录(拖拽单个)
+  const doRemoteToLocal = async (remotePath: string, name: string, targetDir: string) => {
+    setBusy(true)
+    const err = await transferRemoteToLocal(remotePath, targetDir)
+    setBusy(false)
+    if (err) { showToast(`下载失败: ${err}`, 'warn'); return }
+    showToast(`已下载 ${name} → ${targetDir}`)
+    fetchBrowse(browsePath)
+  }
+
+  // 拖拽批量下载:串行执行,聚合结果,完成后刷新一次列表
+  const downloadBatch = async (files: DndFile[], targetDir: string) => {
+    const list = files.filter(f => !f.isDir)
+    const skippedDirs = files.length - list.length
+    if (list.length === 0) {
+      showToast(skippedDirs ? '目录暂不支持传输,已跳过' : '没有可下载的文件', 'warn')
+      return
+    }
+    setBusy(true)
+    let ok = 0
+    const fails: string[] = []
+    for (const f of list) {
+      const err = await transferRemoteToLocal(f.path, targetDir)
+      if (err) fails.push(`${f.name}: ${err}`); else ok++
+    }
+    setBusy(false)
+    reportBatch('已下载', ok, list.length, fails, targetDir)
+    if (skippedDirs) showToast(`另有 ${skippedDirs} 个目录暂不支持传输,已跳过`, 'warn')
+    fetchBrowse(browsePath)
   }
 
   const handleDrop = async (e: React.DragEvent, targetDir: string) => {
     setDropDir(null)
     if (e.dataTransfer.types.includes(DND_MIME)) {
+      // 本机面板是封闭投放区:DND_MIME 拖拽一律在此终结。旧实现非本面板的拖拽
+      // 只 return 不阻断冒泡,事件会冒到 FileBrowser 根层被当成"本地→远程上传"
+      // ——本地文件掉在本机面板上就静默传到远程并覆盖同名文件
       e.preventDefault()
+      e.stopPropagation()
       const data = readDndData(e)
-      if (!data || data.kind !== 'server') return
-      // 批量下载串行执行:并发会让 busy 状态互相覆盖提前消失,且每个完成后的
-      // 列表刷新会互相竞态
-      if (Array.isArray(data.files) && data.files.length) {
-        for (const f of data.files) { if (!f.isDir) await doRemoteToLocal(f.path, f.name, targetDir) }
+      if (!data) return
+      if (data.kind !== 'server') {
+        showToast(data.kind === 'local' ? '本地文件请拖到右侧远程列表上传' : '仅支持从远程列表拖入下载', 'warn')
         return
       }
-      if (!data.isDir) await doRemoteToLocal(data.path, data.name, targetDir)
+      if (Array.isArray(data.files) && data.files.length) { await downloadBatch(data.files, targetDir); return }
+      if (data.isDir) { showToast('目录暂不支持传输,已跳过', 'warn'); return }
+      await doRemoteToLocal(data.path, data.name, targetDir)
     }
   }
 
   return (
-    <div className="flex flex-col bg-bg-900 border-r border-slate-800 min-h-0 shrink-0" style={{ width }}>
+    <div data-localpanel className="flex flex-col bg-bg-900 border-r border-slate-800 min-h-0 shrink-0" style={{ width }}>
       {/* 标题 */}
       <div className="h-10 border-b border-slate-800/60 px-3 flex items-center gap-2 shrink-0">
         <Computer size={14} className="text-accent-400" />
@@ -248,9 +297,11 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: P
       <div
         className={`flex-1 min-h-0 overflow-y-auto space-y-0.5 px-1.5 py-1.5 transition-colors ${dropDir === '' ? 'bg-accent-500/5 ring-1 ring-inset ring-accent-500/40' : ''}`}
         onDragOver={(ev) => {
+          // 只用 types 判断:浏览器规范规定 dragover 期间 getData 恒为空,
+          // 旧实现在这里 readDndData 判 kind 恒失败,拖入高亮从不出现
           if (!ev.dataTransfer.types.includes(DND_MIME)) return
           if ((ev.target as HTMLElement).closest('[data-dirdrop]')) return
-          if (readDndData(ev)?.kind === 'server') { ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = ''; setDropDir('') }
+          ev.preventDefault(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = ''; setDropDir('')
         }}
         onDragLeave={(ev) => { if (!ev.currentTarget.contains(ev.relatedTarget as Node)) setDropDir(null) }}
         onDrop={(ev) => handleDrop(ev, browsePath)}
@@ -267,9 +318,9 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange }: P
                 key={`${e.name}-${i}`}
                 data-dirdrop
                 onClick={() => setBrowsePath(browsePath ? joinPath(browsePath, e.name) : e.name)}
-                onDragOver={(ev) => { if (readDndData(ev)?.kind === 'server') { ev.preventDefault(); ev.stopPropagation(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = joinPath(browsePath, e.name); setDropDir(joinPath(browsePath, e.name)) } }}
+                onDragOver={(ev) => { if (ev.dataTransfer.types.includes(DND_MIME)) { ev.preventDefault(); ev.stopPropagation(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = joinPath(browsePath, e.name); setDropDir(joinPath(browsePath, e.name)) } }}
                 onDragLeave={() => setDropDir(cur => (cur === joinPath(browsePath, e.name) ? null : cur))}
-                onDrop={(ev) => { ev.stopPropagation(); const data = readDndData(ev); if (data?.kind === 'server' && !data.isDir) { ev.preventDefault(); handleDrop(ev, joinPath(browsePath, e.name)) } }}
+                onDrop={(ev) => { ev.stopPropagation(); handleDrop(ev, joinPath(browsePath, e.name)) }}
                 className={`flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-xs ${isTarget ? 'bg-accent-500/15 outline outline-1 outline-accent-500/50 text-accent-300' : 'hover:bg-bg-700 text-slate-400 hover:text-slate-200'}`}
                 title={e.name}
               >

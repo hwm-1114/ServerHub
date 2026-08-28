@@ -5,6 +5,7 @@ import { collectDroppedFiles } from '../lib/dragFiles'
 import { ConfirmDialog } from './ConfirmDialog'
 import { RemoteLocalPanel } from './RemoteLocalPanel'
 import { apiFetch } from '../lib/api'
+import { withWsToken } from '../lib/token'
 import { DND_MIME, makeDndData, readDndData, DndFile } from './DeviceFilePanel'
 import {
   Folder, File, ChevronRight, Home, ArrowUp, RefreshCw, Plug,
@@ -62,6 +63,8 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   const localPanelWidthRef = useRef(localPanelWidth)
   // 本机面板当前目录 + 远程文件批量勾选(下载选中到本机)
   const [localPanelPath, setLocalPanelPath] = useState('')
+  // 本机面板刷新信号:批量下载完成后通知面板重新列目录
+  const [localPanelRefresh, setLocalPanelRefresh] = useState(0)
   const [selRemote, setSelRemote] = useState<Set<string>>(new Set())
   const [downloading, setDownloading] = useState(false)
   // 远程目录批量勾选模式:由工具栏开关控制,不再随"打开本机面板"自动出现
@@ -71,12 +74,13 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   // 目录加载请求序号:仅最新一次 loadDir 的响应允许写入 state(防快速导航竞态)
   const loadSeqRef = useRef(0)
 
-  // 批量下载选中远程文件到本机当前目录
+  // 批量下载选中远程文件到本机当前目录(串行,聚合每文件失败原因)
   const downloadSelectedLocal = async () => {
     const files = Array.from(selRemote)
     if (files.length === 0 || !localPanelPath) { setNotice('请勾选远程文件,且本机面板需进入一个目录'); return }
     setDownloading(true)
     let ok = 0
+    const fails: string[] = []
     for (const p of files) {
       const name = p.split('/').filter(Boolean).pop() || ''
       try {
@@ -84,13 +88,22 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ remotePath: p, localDir: localPanelPath }),
         })
-        const d = await r.json()
-        if (r.ok && !d.error) ok++
-      } catch {}
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+        ok++
+      } catch (err) {
+        fails.push(`${name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
     }
     setDownloading(false)
     setSelRemote(new Set())
-    setNotice(`已下载 ${ok}/${files.length} 个文件到 ${localPanelPath}`)
+    // 通知本机面板刷新:旧实现只刷远端列表,新下载的文件在本机面板里看不到
+    setLocalPanelRefresh(n => n + 1)
+    if (fails.length === 0) setNotice(`已下载 ${ok}/${files.length} 个文件到 ${localPanelPath}`)
+    else {
+      const head = fails.slice(0, 2).join('；')
+      setNotice(`已下载 ${ok}/${files.length} 个文件,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`)
+    }
   }
 
   // 切换单个文件选中,并更新 shift 锚点
@@ -484,10 +497,12 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
     const full = currentPath.endsWith('/')
       ? currentPath + entry.filename
       : currentPath + '/' + entry.filename
-    // Chrome 支持拖出到系统文件夹直接保存
     e.dataTransfer.effectAllowed = 'copy'
+    // Chrome 支持拖出到系统文件夹直接保存;访问令牌需走 URL 参数
+    // (原生拖出是浏览器直接拉取,不带 X-ServerHub-Token 头)
     try {
-      e.dataTransfer.setData('DownloadURL', `application/octet-stream:${entry.filename}:${window.location.origin}/api/servers/${serverId}/files/download?path=${encodeURIComponent(full)}`)
+      const dlUrl = withWsToken(`/api/servers/${serverId}/files/download?path=${encodeURIComponent(full)}`)
+      e.dataTransfer.setData('DownloadURL', `application/octet-stream:${entry.filename}:${window.location.origin}${dlUrl}`)
     } catch {}
     // 界面内下载区识别
     e.dataTransfer.setData('application/x-sdh-dl', full)
@@ -525,7 +540,7 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
     window.addEventListener('mouseup', onUp)
   }
 
-  // 接收从本机面板拖入的本地文件 → 上传远端当前目录
+  // 接收从本机面板拖入的本地文件 → 上传远端当前目录(串行,聚合每文件失败原因)
   const onLocalToRemoteDrop = async (e: React.DragEvent) => {
     e.preventDefault()
     dragDepthRef.current = 0
@@ -533,9 +548,12 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
     if (!e.dataTransfer || !isConnected) return
     const data = readDndData(e)
     if (!data || data.kind !== 'local') return
-    const items = (Array.isArray(data.files) && data.files.length) ? data.files.filter((f: DndFile) => !f.isDir) : (data.isDir ? [] : [data as DndFile])
-    if (items.length === 0) return
+    const all: DndFile[] = Array.isArray(data.files) && data.files.length ? data.files : [data as DndFile]
+    const items = all.filter((f: DndFile) => !f.isDir)
+    const skippedDirs = all.length - items.length
+    if (items.length === 0) { setNotice('目录暂不支持传输,已跳过'); return }
     let ok = 0
+    const fails: string[] = []
     for (const f of items) {
       try {
         const r = await fetch(`/api/servers/${serverId}/files/local-to-remote`, {
@@ -543,11 +561,19 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ localPath: f.path, remoteDir: currentPath }),
         })
-        const d = await r.json()
-        if (r.ok) ok++
-      } catch {}
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+        ok++
+      } catch (err) {
+        fails.push(`${f.name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
     }
-    setNotice(`已上传 ${ok}/${items.length} 个文件 → ${currentPath}`)
+    const skipNote = skippedDirs ? `(已跳过 ${skippedDirs} 个目录)` : ''
+    if (fails.length === 0) setNotice(`已上传 ${ok}/${items.length} 个文件 → ${currentPath}${skipNote}`)
+    else {
+      const head = fails.slice(0, 2).join('；')
+      setNotice(`已上传 ${ok}/${items.length} 个文件${skipNote},失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`)
+    }
     setTimeout(() => { loadDir(currentPath); fetchBookmarks() }, 600)
   }
 
@@ -621,6 +647,13 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
       onDragEnter={onRootDragEnter}
       onDragLeave={onRootDragLeave}
       onDrop={(e) => {
+        // 落点在本机面板内的拖拽不作为上传:面板自身处理 DND_MIME(已 stopPropagation),
+        // 这里兜住"系统文件拖到本机面板"——用户意图是存本机,浏览器做不到,明确提示
+        if ((e.target as HTMLElement).closest?.('[data-localpanel]')) {
+          e.preventDefault()
+          if (e.dataTransfer.types.includes('Files')) setNotice('系统文件请拖到右侧远程区域上传;本机面板只接收远程文件的拖入下载')
+          return
+        }
         // 来自本机(Windows)面板的拖拽 → 上传远端;来自系统文件 → 普通上传
         if (e.dataTransfer.types.includes(DND_MIME)) { onLocalToRemoteDrop(e); return }
         onUploadDrop(e)
@@ -629,7 +662,7 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
       {/* 本机(Windows)目录面板:可开关,与远程文件之间互相拖拽上传下载 */}
       {showLocalPanel && (
         <>
-          <RemoteLocalPanel serverId={serverId} width={localPanelWidth} remoteDir={currentPath} onPathChange={setLocalPanelPath} />
+          <RemoteLocalPanel serverId={serverId} width={localPanelWidth} remoteDir={currentPath} onPathChange={setLocalPanelPath} refreshSignal={localPanelRefresh} />
           <div
             onMouseDown={startLocalPanelResize}
             className="w-1.5 flex-shrink-0 cursor-col-resize bg-slate-800 hover:bg-accent-500/40 active:bg-accent-500/70 transition-colors"
@@ -676,7 +709,12 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
 
           {/* 本机(Windows)目录面板开关:可与远程文件互相拖拽上传下载 */}
           <button
-            onClick={() => setShowLocalPanel(p => !p)}
+            onClick={() => setShowLocalPanel(p => {
+              // 关闭时清空父级记录的本机目录:旧实现路径残留,批量下载会写进
+              // 一个看不见的旧目录
+              if (p) setLocalPanelPath('')
+              return !p
+            })}
             className={`p-1.5 rounded hover:bg-bg-600 ${showLocalPanel ? 'text-accent-400 bg-accent-500/10' : 'text-slate-400 hover:text-accent-400'}`}
             title={showLocalPanel ? '关闭本机目录面板' : '打开本机(Windows)目录面板(可与远程互拖上传下载)'}
           >

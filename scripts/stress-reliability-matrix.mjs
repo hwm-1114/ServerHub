@@ -79,6 +79,8 @@ class FakeReadStream extends EventEmitter {
     setImmediate(() => {
       if (!node || node.isDir || !node.content) { this.emit('error', new Error('no such file')); return }
       this.emit('data', node.content)
+      // flaky 节点:发出数据后中途报错(R15b 验证半成品清理)
+      if (node.flaky) { this.emit('error', new Error('simulated mid-stream failure')); return }
       this.emit('end')
       this.emit('close')
     })
@@ -485,6 +487,50 @@ console.log('== R13:15 秒全并发大乱炖(会话+传输+API 洪峰) ==')
   ok(socks.every(s => lineCount(s) > 30), '乱炖后会话任务仍在输出(R13)')
   ok(server.listening, '进程存活(R13)')
   for (const s of socks) { s.ws.close() }
+}
+
+// ============ R14/R15:本机↔远端互传的失败收尾与完整性 ============
+console.log('== R14:local-to-remote 正常回环 + 本地文件缺失快速失败 ==')
+{
+  seedFS()
+  // 正常回环:本地文件 → 远端(验证 runTransfer 成功路径含大小核对)
+  const upSrc = path.join(tmp, 'r14-up.bin')
+  fs.writeFileSync(upSrc, 'hello-r14-local-to-remote')
+  let t0 = Date.now()
+  const up = await api('POST', '/api/servers/srv-b/files/local-to-remote', { localPath: upSrc, remoteDir: '/tmp' })
+  ok(up.status === 200, `local-to-remote 成功(${up.status})(R14)`)
+  ok(fakeFS.get('/tmp/r14-up.bin')?.content?.toString() === 'hello-r14-local-to-remote', '远端内容完整(R14)')
+  // 本地文件缺失:必须在打开远端写流之前快速失败,不留远端半成品
+  const t1 = Date.now()
+  const miss = await api('POST', '/api/servers/srv-b/files/local-to-remote', { localPath: path.join(tmp, 'no-such-local.bin'), remoteDir: '/tmp' })
+  ok(miss.status === 500, `本地缺失返回 500(${miss.status})(R14)`)
+  ok(Date.now() - t1 < 5000, `快速失败不悬挂(${Date.now() - t1}ms)(R14)`)
+  ok(!fakeFS.has('/tmp/no-such-local.bin'), '远端无半成品残留(R14)')
+  // 失败后文件连接仍可用(僵尸请求/句柄泄漏会在这里暴露)
+  const after = await uploadFile('/tmp', 'r14-after.txt', 64, 'srv-b')
+  ok(after.status === 201, `失败后连接仍可复用(${after.status})(R14)`)
+}
+
+console.log('== R15:remote-to-local 缺失快速失败 + 中途断流清理半成品 ==')
+{
+  seedFS()
+  const dlDir = path.join(tmp, 'r15-dl')
+  // 远端不存在:先 stat 就失败,不写本地任何文件
+  const t0 = Date.now()
+  const miss = await api('POST', '/api/servers/srv-b/files/remote-to-local', { remotePath: '/tmp/no-such-remote.bin', localDir: dlDir })
+  ok(miss.status === 500, `远端缺失返回 500(${miss.status})(R15)`)
+  ok(Date.now() - t0 < 5000, `快速失败不悬挂(${Date.now() - t0}ms)(R15)`)
+  ok(!fs.existsSync(path.join(dlDir, 'no-such-remote.bin')), '本地无半成品残留(R15)')
+  // 中途断流:读到一半 SFTP 流报错 → 本地半成品必须被清理
+  fakeFS.set('/tmp/r15-flaky.bin', { isDir: false, content: Buffer.from('partial-partial'), size: 15, flaky: true })
+  const flaky = await api('POST', '/api/servers/srv-b/files/remote-to-local', { remotePath: '/tmp/r15-flaky.bin', localDir: dlDir })
+  ok(flaky.status === 500, `中途断流返回 500(${flaky.status})(R15)`)
+  ok(String(flaky.data?.error || '').includes('读取源文件失败'), `报错指向源流失败(${JSON.stringify(flaky.data?.error || '').slice(0, 60)})(R15)`)
+  ok(!fs.existsSync(path.join(dlDir, 'r15-flaky.bin')), '断流后本地半成品已清理(R15)')
+  // 正常回环:远端 → 本地(验证成功路径)
+  const good = await api('POST', '/api/servers/srv-b/files/remote-to-local', { remotePath: '/tmp/dir4/DIR4-file2.txt', localDir: dlDir })
+  ok(good.status === 200 && fs.readFileSync(path.join(dlDir, 'DIR4-file2.txt'), 'utf-8') === 'content of dir4 file2\n', '远端→本地内容完整(R15)')
+  ok(server.listening, '进程存活(R15)')
 }
 
 console.log('\n========================================')

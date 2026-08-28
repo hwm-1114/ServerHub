@@ -103,13 +103,15 @@ export function getDefaultLocalDir() {
 
 // ========== 目录浏览 ==========
 /** 列出目录内容(Windows:根路径或空返回盘符)。返回 { entries, note } */
-export function browseDirectory(dirPath) {
+// 全异步 fs.promises:旧实现 readdirSync + 逐文件 statSync 会把大目录(System32 几千条)
+// 的遍历变成同步阻塞,期间整个后端事件循环(含所有终端 WS)卡顿几十~几百 ms
+export async function browseDirectory(dirPath) {
   // 无路径或空 → 返回盘符
   if (!dirPath) return { entries: listDrives(), note: '' }
 
   let stat
   try {
-    stat = fs.statSync(dirPath)
+    stat = await fs.promises.stat(dirPath)
   } catch {
     return { entries: [], note: '无法访问:路径不存在或无权访问' }
   }
@@ -118,17 +120,19 @@ export function browseDirectory(dirPath) {
   }
   let names
   try {
-    names = fs.readdirSync(dirPath, { withFileTypes: true })
+    names = await fs.promises.readdir(dirPath, { withFileTypes: true })
   } catch (e) {
     return { entries: [], note: `无法读取: ${e.message}` }
   }
-  const entries = names.map((d) => {
+  // 顺序 stat(非阻塞):与旧同步实现工作量相同,但不再卡事件循环
+  const entries = []
+  for (const d of names) {
     let size = 0
     if (d.isFile()) {
-      try { size = fs.statSync(path.join(dirPath, d.name)).size } catch { size = 0 }
+      try { size = (await fs.promises.stat(path.join(dirPath, d.name))).size } catch { size = 0 }
     }
-    return { name: d.name, isDir: d.isDirectory(), size }
-  })
+    entries.push({ name: d.name, isDir: d.isDirectory(), size })
+  }
   // 目录优先排序,再按名称
   entries.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1))
   return { entries, note: '' }
@@ -193,12 +197,19 @@ function writeTransferState(state) {
 export function getTransferState() {
   return readTransferState()
 }
+// 写入按文件互斥排队:并发保存(如上传/下载几乎同时记住各自目录)旧实现是
+// 裸"读-改-写",后写的会用旧快照覆盖先写的字段,造成丢更新
+let transferStateChain = Promise.resolve()
 export function saveTransferState(state) {
-  const cur = readTransferState()
-  writeTransferState({
-    devicePath: validateString(state.devicePath) ?? cur.devicePath ?? '',
-    localDir: validateString(state.localDir) ?? cur.localDir ?? '',
+  const run = transferStateChain.catch(() => {}).then(() => {
+    const cur = readTransferState()
+    writeTransferState({
+      devicePath: validateString(state.devicePath) ?? cur.devicePath ?? '',
+      localDir: validateString(state.localDir) ?? cur.localDir ?? '',
+    })
   })
+  transferStateChain = run
+  return run
 }
 function validateString(v) {
   return typeof v === 'string' ? v : null

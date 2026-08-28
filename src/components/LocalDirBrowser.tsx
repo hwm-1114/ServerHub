@@ -245,40 +245,62 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
   // 勾选模式默认填写上次使用的设备目标目录
   useEffect(() => { if (lastDevicePath && !batchDevicePath) setBatchDevicePath(lastDevicePath) }, [lastDevicePath, batchDevicePath])
 
-  // 下载:设备文件 → 本地目录(拖拽触发)
-  const doDownload = async (devicePath: string, name: string, targetDir: string) => {
-    setBusy('recv')
+  // 核心:单个 设备→本机 下载,返回错误文本而不直接弹提示(单次与批量共用)
+  const transferDeviceToLocal = async (devicePath: string, targetDir: string): Promise<string | null> => {
     try {
       const r = await fetch('/api/local/hdc-recv', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ devicePath, localDir: targetDir }),
       })
-      const d = await r.json()
-      if (!r.ok) throw new Error(d.error || '下载失败')
-      saveState({ devicePath, localDir: targetDir })
-      setLastDevicePath(devicePath)
-      showToast(`已从设备下载 ${name} → ${targetDir}`)
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+      return null
     } catch (err) {
-      showToast(`下载失败: ${err instanceof Error ? err.message : '未知错误'}`, 'warn')
-    } finally {
-      setBusy(null)
+      return err instanceof Error ? err.message : '未知错误'
     }
+  }
+
+  // 拖拽批量下载(设备 → 本机目录):串行执行(并发会让 busy 计数互相覆盖提前结束,
+  // 刷新也会竞态),聚合每文件失败原因,完成后刷新一次列表
+  const downloadDeviceFiles = async (files: DndFile[], targetDir: string) => {
+    const list = files.filter(f => !f.isDir)
+    const skippedDirs = files.length - list.length
+    if (list.length === 0) {
+      showToast(skippedDirs ? '目录暂不支持传输,已跳过' : '没有可下载的文件', 'warn')
+      return
+    }
+    setBusy('recv')
+    let ok = 0
+    const fails: string[] = []
+    for (const f of list) {
+      const err = await transferDeviceToLocal(f.path, targetDir)
+      if (err) fails.push(`${f.name}: ${err}`); else ok++
+      if (ok === 1 && !err) { setLastDevicePath(f.path); saveState({ devicePath: f.path, localDir: targetDir }) }
+    }
+    setBusy(null)
+    if (fails.length === 0) showToast(`已下载 ${ok}/${list.length} 个文件 → ${targetDir}`)
+    else {
+      const head = fails.slice(0, 2).join('；')
+      showToast(`已下载 ${ok}/${list.length} 个文件,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`, 'warn')
+    }
+    if (skippedDirs) showToast(`另有 ${skippedDirs} 个目录暂不支持传输,已跳过`, 'warn')
+    fetchBrowse(browsePath)
   }
 
   const handleLocalListDrop = async (e: React.DragEvent) => {
     setDropDir(null)
     if (e.dataTransfer.types.includes(DND_MIME)) {
+      // 封闭投放区:DND_MIME 拖拽在此终结,不再向父层冒泡
       e.preventDefault()
+      e.stopPropagation()
       const data = readDndData(e)
-      if (!data || data.kind !== 'device') return
+      if (!data) return
+      if (data.kind !== 'device') { showToast('仅支持从设备面板拖入下载', 'warn'); return }
       const target = dropDirRef.current || browsePath
-      // 批量下载串行执行:并发会让 busy 计数互相覆盖提前结束,刷新也会竞态
-      if (Array.isArray(data.files) && data.files.length) {
-        for (const f of data.files) { if (!f.isDir) await doDownload(f.path, f.name, target) }
-        return
-      }
-      if (!data.isDir) await doDownload(data.path, data.name, target)
+      if (Array.isArray(data.files) && data.files.length) { await downloadDeviceFiles(data.files, target); return }
+      if (data.isDir) { showToast('目录暂不支持传输,已跳过', 'warn'); return }
+      await downloadDeviceFiles([data as DndFile], target)
     }
   }
 
@@ -310,29 +332,38 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
     toggleLocalSelect(path, i)
   }
 
-  // 批量上传选中本地文件到设备
+  // 批量上传选中本地文件到设备(串行,聚合每文件失败原因)
   const uploadSelectedToDevice = async () => {
     const files = Array.from(selected)
     const target = batchDevicePath.trim()
     if (files.length === 0 || !target) { showToast('请选择文件,并填写设备目标目录', 'warn'); return }
     setBatchBusy(true)
     let ok = 0
+    const fails: string[] = []
     for (const p of files) {
+      const name = p.split(/[\\/]/).filter(Boolean).pop() || p
       try {
         const r = await fetch('/api/local/hdc-send', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ localPath: p, devicePath: target }),
         })
-        const d = await r.json()
-        if (r.ok && !d.error) ok++
-      } catch {}
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+        ok++
+      } catch (err) {
+        fails.push(`${name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
     }
     setBatchBusy(false)
     setSelected(new Set())
     setSelectMode(false)
     setLastDevicePath(target)
     saveState({ devicePath: target })
-    showToast(`已上传 ${ok}/${files.length} 个文件到设备`)
+    if (fails.length === 0) showToast(`已上传 ${ok}/${files.length} 个文件到设备`)
+    else {
+      const head = fails.slice(0, 2).join('；')
+      showToast(`已上传 ${ok}/${files.length} 个文件,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`, 'warn')
+    }
   }
 
   // 打开上传弹窗时默认回到记住的设备路径
@@ -479,21 +510,7 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
                   if (ev.dataTransfer.types.includes(DND_MIME)) { ev.preventDefault(); ev.stopPropagation(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = joinPath(browsePath, e.name); setDropDir(joinPath(browsePath, e.name)) }
                 }}
                 onDragLeave={() => setDropDir(cur => (cur === joinPath(browsePath, e.name) ? null : cur))}
-                onDrop={(ev) => {
-                  ev.stopPropagation()
-                  const data = readDndData(ev)
-                  if (data && data.kind === 'device') {
-                    ev.preventDefault()
-                    const target = joinPath(browsePath, e.name)
-                    dropDirRef.current = target
-                    setDropDir(null)
-                    if (Array.isArray(data.files) && data.files.length) {
-                      for (const f of data.files) if (!f.isDir) doDownload(f.path, f.name, target)
-                    } else if (!data.isDir) {
-                      doDownload(data.path, data.name, target)
-                    }
-                  }
-                }}
+                onDrop={(ev) => { ev.stopPropagation(); handleLocalListDrop(ev) }}
                 className={`flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-xs ${
                   isTarget
                     ? 'bg-accent-500/15 outline outline-1 outline-accent-500/50 text-accent-300'

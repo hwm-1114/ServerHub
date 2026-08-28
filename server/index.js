@@ -253,63 +253,169 @@ app.get('/api/servers/:id/files/download', async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: err.message })
   }
 })
-// local-to-remote:本机(Windows)文件 → 远端目录(与 remote-to-local 对称,双面板拖拽上传用)。
-// 归档时该路由的声明与参数解析行丢失,此处按 remote-to-local 的对称结构补回:
+// ========== 本机 ↔ 远端互传(local-to-remote / remote-to-local) ==========
+// 响应只发一次:两条路由的多个错误来源(源流/目标流/核对/清理)共享一个出口,
+// 旧实现的错误回调没有防重,叠加失败时会 double-response 抛 ERR_HTTP_HEADERS_SENT。
+function makeRespondOnce(res) {
+  let sent = false
+  return (code, payload) => {
+    if (sent) return
+    sent = true
+    res.status(code).json(payload)
+  }
+}
+
+// 传输看护阈值:与 hdc 传输的 30min 上限对齐;空闲 60s 无字节进展即中止
+// (SFTP 半开连接时 close/error 都不会来,旧实现会前后端一起永久挂起)
+const TRANSFER_TOTAL_TIMEOUT = 30 * 60 * 1000
+const TRANSFER_IDLE_TIMEOUT = 60 * 1000
+
+// 本机↔远端单文件互传的公共管道收尾,两条路由共用:
+// - 任一端出错:destroy 两端流 → 清理半成品 → 立即报错。旧实现读流出错只回 500
+//   不关写流,写流 'close' 永不触发,路由 await 挂死(僵尸请求 + 句柄泄漏 + 半成品残留)
+// - 超时:空闲 60s 无进展或总时长超 30min,走与错误相同的清理路径
+// - 完整性:'close' 后核对目标端实际大小与源端大小,不符删半成品报错(与 /files/upload 同标准)
+async function runTransfer({ rs, ws, expectedSize, verifySize, cleanupPartial, respond, successPayload }) {
+  const start = Date.now()
+  let lastActivity = start
+  let settled = false
+  let failing = false
+  rs.on('data', () => { lastActivity = Date.now() })
+  let timer = null
+  const stopTimer = () => { if (timer) { clearInterval(timer); timer = null } }
+  const settle = (code, payload) => {
+    if (settled) return
+    settled = true
+    stopTimer()
+    respond(code, payload)
+  }
+  // fail 同步置 failing 标志:防止清理期间的 'close' 事件抢先把半成品当成功核对
+  const fail = (message) => {
+    if (settled || failing) return Promise.resolve()
+    failing = true
+    stopTimer()
+    try { rs.destroy() } catch { /* 已结束 */ }
+    try { ws.destroy() } catch { /* 已结束 */ }
+    return Promise.resolve().then(cleanupPartial).catch(() => {}).then(() => settle(500, { error: message }))
+  }
+  timer = setInterval(() => {
+    const now = Date.now()
+    if (now - lastActivity > TRANSFER_IDLE_TIMEOUT) {
+      fail(`传输超时中止:${TRANSFER_IDLE_TIMEOUT / 1000} 秒无数据进展(连接可能已中断),已清理半成品,请重试`)
+    } else if (now - start > TRANSFER_TOTAL_TIMEOUT) {
+      fail(`传输超时中止:总时长超过 ${TRANSFER_TOTAL_TIMEOUT / 60000} 分钟,已清理半成品,请重试`)
+    }
+  }, 1000)
+  return new Promise((resolve) => {
+    rs.on('error', (e) => { fail(`读取源文件失败: ${e.message}`).then(resolve) })
+    ws.on('error', (e) => { fail(`写入目标失败: ${e.message}`).then(resolve) })
+    ws.on('close', () => {
+      if (settled || failing) { resolve(); return }
+      ;(async () => {
+        stopTimer()
+        try {
+          const actual = await verifySize()
+          if (actual !== expectedSize) {
+            failing = true
+            try { await cleanupPartial() } catch { /* 清理失败忽略 */ }
+            settle(500, { error: `传输不完整:目标端 ${actual} 字节,预期 ${expectedSize} 字节,已删除半成品,请重试` })
+          } else {
+            settle(200, successPayload)
+          }
+        } catch (e) {
+          settle(500, { error: `传输结果核对失败: ${e.message}` })
+        }
+        resolve()
+      })()
+    })
+    rs.pipe(ws)
+  })
+}
+
+// local-to-remote:本机文件 → 远端目录(与 remote-to-local 对称,双面板拖拽上传用)。
 // 本机 fs 读流直接 pipe 到独立文件连接的 SFTP 写流(恒定内存,支持大文件)。
+// 失败收尾/超时/完整性核对统一走 runTransfer(见下),不再出现"读流出错后路由挂死、
+// 远端半成品残留、静默变小"的问题。
 app.post('/api/servers/:id/files/local-to-remote', async (req, res) => {
   const { localPath, remoteDir } = req.body || {}
   if (!localPath || !remoteDir) return res.status(400).json({ error: '缺少 localPath/remoteDir' })
   const name = String(localPath).split(/[\\/]/).filter(Boolean).pop()
   if (!name) return res.status(500).json({ error: '无效的本地路径' })
   const remotePath = `${String(remoteDir).replace(/\/+$/, '')}/${name}`
-  const { createReadStream } = await import('fs')
+  const respond = makeRespondOnce(res)
+  const { createReadStream, statSync } = await import('fs')
   try {
+    // 先取本地大小并排除目录:读不了就快速失败,根本不去远端开写流
+    let localSize
+    try {
+      const st = statSync(String(localPath))
+      if (st.isDirectory()) throw new Error('本地路径是一个目录')
+      localSize = st.size
+    } catch (e) {
+      return respond(500, { error: `读取本地文件失败: ${e.message}` })
+    }
     await ensureFileClient(req.params.id) // 独立文件连接,不占用终端连接的通道
-    const { writeStream } = await retryFileAfterReconnect(req.params.id, () => createUploadStream(req.params.id, remotePath))
+    const { writeStream, sftp } = await retryFileAfterReconnect(req.params.id, () => createUploadStream(req.params.id, remotePath))
     const rs = createReadStream(String(localPath))
-    rs.on('error', (e) => { res.status(500).json({ error: `读取本地文件失败: ${e.message}` }) })
-    rs.pipe(writeStream)
-    await new Promise((resolve, reject) => {
-      writeStream.on('close', () => resolve())
-      writeStream.on('error', (e) => reject(e))
+    await runTransfer({
+      rs,
+      ws: writeStream,
+      expectedSize: localSize,
+      // 完成后核对远端真实大小(SFTP 无端到端字节核对,防止"静默变小")
+      verifySize: () => new Promise((res2, rej2) => sftp.stat(remotePath, (e, st) => e ? rej2(e) : res2(st.size))),
+      // 半成品清理:用当前(可能已自愈重连的)文件连接删掉远端半个文件
+      cleanupPartial: async () => {
+        try {
+          const s = await getFileSftp(req.params.id)
+          s.unlink(remotePath, () => {})
+        } catch { /* 清理失败忽略:报错为主 */ }
+      },
+      respond,
+      successPayload: { success: true },
     })
-    res.json({ success: true })
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: err.message })
+    respond(500, { error: err.message })
   }
 })
 
 // remote-to-local:SFTP 读远端文件 → 本机 fs 写本地目录
-// 打开 SFTP 读流用 retryAfterReconnect 包裹:多次拖拽传输会把单条 SSH 连接上的
-// session/channel 用完(sshd MaxSessions),出现 "(SSH) channel open failure" 时自动
-// 重连再试。createWriteStream 默认 'w' 标志即覆盖已存在的同名本地文件。
+// 打开 SFTP 读流用 retryAfterReconnect 包裹:通道耗尽("channel open failure")时
+// 自动重连文件连接再试,绝不动终端 shell。createWriteStream 默认 'w' 即覆盖同名文件。
 app.post('/api/servers/:id/files/remote-to-local', async (req, res) => {
   const { remotePath, localDir } = req.body || {}
   if (!remotePath || !localDir) return res.status(400).json({ error: '缺少 remotePath/localDir' })
-  const { createWriteStream, mkdirSync, existsSync } = await import('fs')
+  const { createWriteStream, mkdirSync, existsSync, statSync, unlinkSync } = await import('fs')
   const name = String(remotePath).split('/').filter(Boolean).pop()
   if (!name) return res.status(500).json({ error: '无效的远端路径' })
   // path.join 按平台拼分隔符(旧实现硬编码 \\,后端跑在 Linux/macOS 上会拼出错误路径)
   const localPath = path.join(String(localDir), name)
+  const respond = makeRespondOnce(res)
   try {
     await ensureFileClient(req.params.id) // 独立文件连接,不占用终端连接通道
+    const sftp = await retryFileAfterReconnect(req.params.id, () => getFileSftp(req.params.id))
+    // 先取远端大小:既是完整性核对基准,也把"远端读不了"提前到写本地之前快速失败
+    const remoteSize = await new Promise((res2, rej2) => {
+      sftp.stat(String(remotePath), (e, st) => e ? rej2(new Error(`读取远端失败: ${e.message}`)) : res2(st.size))
+    })
     if (!existsSync(String(localDir))) mkdirSync(String(localDir), { recursive: true })
-    // 在独立文件连接上复用同一个 sftp 读流;通道耗尽只重连文件连接,绝不动终端 shell
+    // 在独立文件连接上复用同一个 sftp 读流
     const rs = await retryFileAfterReconnect(req.params.id, async () => {
       const s = await getFileSftp(req.params.id)
       return s.createReadStream(String(remotePath))
     })
     const ws = createWriteStream(localPath) // 默认 'w',覆盖已存在文件
-    rs.on('error', (e) => { if (!res.headersSent) res.status(500).json({ error: `读取远端失败: ${e.message}` }) })
-    ws.on('error', (e) => { if (!res.headersSent) res.status(500).json({ error: `写本地失败: ${e.message}` }) })
-    rs.pipe(ws)
-    await new Promise((resolve, reject) => {
-      ws.on('close', () => resolve())
-      ws.on('error', (e) => reject(e))
+    await runTransfer({
+      rs,
+      ws,
+      expectedSize: remoteSize,
+      verifySize: async () => statSync(localPath).size,
+      // 半成品清理:传输中断留下的半个本地文件必须删掉,不能假装成功
+      cleanupPartial: async () => { try { unlinkSync(localPath) } catch { /* 可能尚未创建 */ } },
+      respond,
+      successPayload: { success: true, savePath: localPath },
     })
-    res.json({ success: true, savePath: localPath })
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: err.message })
+    respond(500, { error: err.message })
   }
 })
 
@@ -771,9 +877,9 @@ app.get('/api/servers/:id/sessions/:sessionId/cwd', async (req, res) => {
 
 // ========== 本地终端 API(本机目录/收藏) ==========
 // 本机目录浏览:path 为空返回盘符列表
-app.get('/api/local/browse', (req, res) => {
+app.get('/api/local/browse', async (req, res) => {
   const dir = req.query.path ? String(req.query.path) : null
-  res.json(browseDirectory(dir))
+  res.json(await browseDirectory(dir))
 })
 
 // 用 Windows 资源管理器打开一个本地目录
