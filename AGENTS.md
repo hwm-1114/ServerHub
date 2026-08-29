@@ -14,7 +14,7 @@
 4. `src/components/TransferBar.tsx` 与 `src/components/LocalTerminal.tsx` **整文件缺失**——已按文档描述 + App.tsx 接口重建（LocalTerminal 镜像 Terminal.tsx 连 `/ws/local`）。
 5. `LocalDirBrowser.tsx`/`Terminal.tsx` 小节丢失闭合围栏，恢复脚本按分隔结构截取，经 tsc 验证完整。
 
-**验证基线（2026-08-22 全部通过）**：`npx tsc --noEmit` 零错误、`npm run build` 成功、五个离线脚本（verify-sessions / verify-20-sessions / stress-transfer-stability / stress-switch-stability / stress-process-reliability）全过；真机（阿里云 Linux，sshd MaxSessions=10）18/18 冒烟通过：exec/上传下载回环/local-to-remote/双会话 WS/**20 并发会话连接池分摊**/文件操作期间终端不断线/本地 PowerShell 终端。真机冒烟脚本在 `.verify/smoke.mjs`（后端 `PORT=3199 SERVERHUB_DATA_DIR=.verify/data` 下运行，测试结束自动清理远端与服务器记录）。
+**验证基线（2026-08-22 全部通过）**：`npx tsc --noEmit` 零错误、`npm run build` 成功、五个离线脚本（verify-sessions / verify-20-sessions / stress-transfer-stability / stress-switch-stability / stress-process-reliability）全过；真机（Linux，sshd MaxSessions=10）18/18 冒烟通过：exec/上传下载回环/local-to-remote/双会话 WS/**20 并发会话连接池分摊**/文件操作期间终端不断线/本地 PowerShell 终端。真机冒烟脚本在 `.verify/smoke.mjs`（后端 `PORT=3199 SERVERHUB_DATA_DIR=.verify/data` 下运行，测试结束自动清理远端与服务器记录）。
 
 **2026-08-22 缺陷修复批次（同日完成，回归全绿）**：P0 五项（dragFiles 拖目录重复+丢文件、requestPath 二次定位失效、exec 通道耗尽杀全池会话、本地终端正常退出重连、loadDir 竞态）；后端五项（删服务器清理 sessions/bookmarks、数据层容错+原子写+串行、hdc 超时 30min、上传 ~ 路径明确报错、id 防撞）；前端反馈四项（apiFetch、批量串行、满员提示）；遗留批次 A/B/C/D 六+一+三+四项（命令复制跨分区重名、分区折叠 key、拖拽半透明、传输完成后刷新、拖拽深度对称、设备列表失败清空；大文件流式另存；ls 单引号转义、WS 会话上限、pendingInitialDir 清理；**访问令牌/CORS 收敛/密码掩码+显式接口/跨平台 shell 与打开器**）。
 

@@ -1,112 +1,129 @@
-# ServerHub - Linux 服务器管理 Web 工具
+# ServerHub
 
-一个精美的 Web 界面工具，用于管理多台远程 Linux 服务器。支持 SSH 终端、文件浏览、命令预设三大核心功能。
+远程 Linux 服务器连接管理工具 —— SSH 终端、SFTP 文件管理、命令预设、本机终端、hdc 设备传输，提供 Web UI 与 Windows 桌面版。
 
-## ✨ 功能特性
+> 为"同时照看多台 Linux 服务器"的运维/开发场景设计：多标签多会话终端、拖拽式文件互传、常用命令一键执行，全部在同一个界面里完成。
 
-### 1. 服务器管理
-- 填入 IP、端口、用户名、密码即可添加服务器
-- 支持多台服务器同时管理
-- 一键连接/断开
-- 实时连接状态指示
+## 功能特性
 
-### 2. SSH 终端
-- 基于 xterm.js 的完整终端模拟
-- 支持所有 shell 命令（ls -l、vim、top 等）
-- 多标签页切换不同服务器
-- 自动适配终端大小
+### 服务器与连接管理
+- 多台服务器统一管理，填入 IP / 端口 / 用户名 / 密码或私钥即可连接
+- 每台服务器最多 **20 个并发会话**，多条终端连接自动分摊（连接池），通道耗尽自动自愈
+- 服务器状态轮询、已连接服务器健康摘要（负载 / 内存）
 
-### 3. 文件浏览器
-- SFTP 远程目录浏览
-- 显示文件权限、大小、修改时间
-- 支持点击进入子目录、返回上级目录
-- 在线查看文本文件内容
-- 支持文件下载
+### SSH 终端
+- 基于 xterm.js 的完整终端体验：彩色输出、vim / htop 等 TUI 程序、鼠标选中复制、右键粘贴
+- 多标签多会话：复制会话保持所在目录、从文件管理器"在当前目录打开会话"
+- **完整历史查看器**：不限大小保留自连接以来的全部输出；对 AI agent（claude 等）/ vim / htop 的全屏与原地重绘输出做终端状态机重建，还原"终端实际显示过的内容"；支持导出保留颜色的 HTML
+- 会话断线有限次自动重连；后台会话持续输出并做标签提醒
 
-### 4. 命令预设
-- 预置 18 条常用命令（系统/进程/网络/文件/日志/Docker/开发环境）
-- 支持自定义命令（shell、python 等）
-- 按分类分组管理
-- 一键执行，实时查看输出
-- 支持搜索、编辑、删除
+### 文件管理
+- SFTP 目录浏览、在线预览与**在线编辑保存**（≤512KB）、递归搜索
+- 上传 / 下载流式传输（内存恒定），完成后核对文件大小，**完整性校验**不合格自动清理半成品
+- 内置"本机目录面板"：本机 ↔ 远程拖拽互传、批量勾选传输、失败逐文件给出原因
+- 重命名 / 移动、递归新建目录、递归删除、目录收藏
 
-## 🚀 快速开始
+### 命令预设
+- 预置 18 条常用命令（系统 / 进程 / 网络 / 文件 / 日志 / Docker / 开发环境）
+- 自定义命令、分类分组、拖拽排序、`autoRun` 自动执行、导入导出
+- 远程与本地两套作用域
 
-### 安装
+### 本机终端
+- 本机 PowerShell / bash 真伪终端（ConPTY / node-pty），彩色、交互命令全支持
+- **同一目录可开多个会话**，目录收藏、一键复制路径、用资源管理器打开
+
+### hdc 设备传输（鸿蒙设备）
+- 自动发现 hdc 连接的设备，多设备 `-t serial` 定向
+- 设备 ↔ 本机文件收发、设备目录浏览
+
+### 桌面版（Windows）
+- Electron 桌面应用，安装即用
+- 运行数据写在 `%APPDATA%\ServerHub`，与安装目录完全隔离：**覆盖升级 / 卸载均不丢失服务器与命令数据**
+
+### 个性化
+- 20 款纯 CSS 动态特效皮肤（粒子 / 光效 / 氛围），纯装饰层不拦截任何交互；跟随系统"减少动态效果"设置自动关闭
+
+## 快速开始
+
+### 方式一：下载安装包（推荐）
+
+到 [Releases](https://github.com/hwm-1114/ServerHub/releases) 下载最新的 `ServerHub Setup x.x.x.exe`，双击安装即可。
+
+### 方式二：从源码运行
+
+环境要求：Node.js 18+；Windows 10+ / macOS / Linux（本地终端与桌面版打包在 Windows 上体验最佳）。
 
 ```bash
-cd server-manager
+git clone https://github.com/hwm-1114/ServerHub.git
+cd ServerHub
 npm install
-```
 
-### 开发模式
-
-```bash
+# 开发模式:后端(3120) + 前端(5173) 热更新
 npm run dev
+# 打开 http://localhost:5173
 ```
 
-- 前端: http://localhost:5173
-- 后端 API: http://localhost:3120
-
-### 生产模式
+生产模式（构建前端后单端口 3120 提供服务）：
 
 ```bash
-npm run build    # 构建前端
-npm start        # 启动服务
+npm run build
+npm start
+# http://localhost:3120
 ```
 
-访问 http://localhost:3120 即可使用。
+Windows 桌面版开发与打包：
 
-## 📁 项目结构
-
-```
-server-manager/
-├── server/              # 后端 (Node.js + Express)
-│   ├── index.js        # Express + WebSocket 服务
-│   └── ssh-manager.js  # SSH 连接管理
-├── src/                 # 前端 (React + TypeScript)
-│   ├── App.tsx         # 主应用
-│   ├── components/
-│   │   ├── Sidebar.tsx       # 侧边栏（服务器列表）
-│   │   ├── ServerModal.tsx    # 添加/编辑服务器弹窗
-│   │   ├── Terminal.tsx       # SSH 终端
-│   │   ├── FileBrowser.tsx    # 文件浏览器
-│   │   └── CommandPresets.tsx # 命令预设面板
-│   ├── types.ts        # TypeScript 类型
-│   └── index.css       # 全局样式
-├── data/               # 运行时数据
-│   ├── servers.json    # 服务器配置
-│   └── commands.json   # 命令预设
-├── dist/               # 构建产物
-└── package.json
+```bash
+npm run app:dev      # 后端 + Vite + Electron 三进程热更新
+# 或双击 publish.bat 一键构建桌面应用
 ```
 
-## 🛠 技术栈
+## 安全须知（请务必阅读）
 
-**后端:**
-- Node.js + Express — HTTP API 服务
-- SSH2 — SSH 连接与 SFTP 文件操作
-- ws — WebSocket 实时终端通信
+ServerHub 定位为**运行在本机 / 内网的个人工具**，以下几点是刻意设计，请根据自己场景判断是否适用：
 
-**前端:**
-- React 18 + TypeScript — UI 框架
-- Vite — 构建工具
-- Tailwind CSS — 样式
-- xterm.js — 终端模拟
-- lucide-react — 图标库
+- **服务器凭据（含密码）明文保存在本地数据文件中**（默认 `data/servers.json`），不加密——便于本机使用与备份。请勿在不可信的主机上运行本工具；数据目录可通过 `SERVERHUB_DATA_DIR` 重定向。
+- 默认**无鉴权**（本机使用零配置）。若端口暴露给非本机访问，务必设置访问令牌：
 
-## 📝 使用说明
+| 环境变量 | 说明 |
+|---|---|
+| `PORT` | 后端监听端口（默认 3120；Electron 生产 33120） |
+| `SERVERHUB_DATA_DIR` | 数据目录（默认 `./data`；Electron 生产为 `%APPDATA%/ServerHub`） |
+| `SERVERHUB_TOKEN` | 设置后 REST 与 WebSocket 强制校验令牌（请求头 `X-ServerHub-Token` 或 `?token=`） |
+| `SERVERHUB_CORS_ORIGIN` | 逗号分隔的来源白名单；不设置则仅允许同源 |
 
-1. **添加服务器**: 点击左侧"添加服务器"按钮，填入 IP、用户名、密码
-2. **连接**: 点击服务器卡片上的连接按钮，或选中后在主区域点击"连接服务器"
-3. **终端**: 选中服务器 → 终端标签 → 自动建立 SSH Shell 连接
-4. **文件浏览**: 选中服务器 → 文件标签 → 浏览远程目录
-5. **命令预设**: 选中服务器 → 命令标签 → 点击"执行"一键运行
+公网部署建议：`SERVERHUB_TOKEN` + 反向代理 + HTTPS + 服务器防火墙收紧来源 IP。
 
-## ⚠️ 注意事项
+## 开发
 
-- 密码以明文存储在 `data/servers.json`（**有意设计**，不加密、界面明文显示）——本项目定位为本地/内网单用户工具，不做多租户隔离；请确保运行本工具的机器安全
-- 若需要在不可信网络暴露端口，务必设置访问令牌：启动前配置环境变量 `SERVERHUB_TOKEN=你的令牌`，之后访问 `http://host:3120/?token=你的令牌`（浏览器会记住并自动附带；REST/WS 均强制校验）
-- 可选配置 `SERVERHUB_CORS_ORIGIN`（逗号分隔的来源白名单）收敛跨域；默认仅同源
-- SSH 连接超时默认 15 秒
-- 终端断开后 SSH 连接保持，可重新打开终端
+```bash
+npm test            # 一键回归:7 个离线脚本(会话隔离/20 并发/传输自愈/切换稳定/进程不崩/完整历史重建/可靠性矩阵 51 断言)
+npm run typecheck   # tsc --noEmit
+npm run lint        # eslint
+```
+
+离线脚本通过伪造 ssh2 Client 与内存文件系统运行，不需要真实服务器。
+
+### 架构一览
+
+```
+server/            Express + ws 单体后端(3120)
+  ssh-manager.js     SSH 连接池(终端连接与独立文件连接隔离)+ SFTP + 数据读写
+  local-exec.js      node-pty 本地终端 / 本机目录 / hdc
+electron/          桌面壳(contextIsolation,生产内置后端 33120)
+src/               React + Vite 前端
+  components/        Terminal / FileBrowser / CommandPanel / SkinPicker ...
+  lib/               TerminalBridge(跨标签终端注册表)/ TransferStore(全局传输队列)
+scripts/           离线验证与压力测试脚本
+```
+
+关键设计：终端连接池与独立文件连接**严格隔离**——文件传输的通道问题绝不牵连终端会话；所有会话的终端实例常驻挂载（切换标签不断线）；传输队列跨标签存活。
+
+## 已知边界
+
+- Web 模式下"本机"指**运行后端的机器**；浏览器拿不到本地文件句柄，文件传输的字节级进度条需桌面版（规划中）
+- 文件在线预览 / 编辑上限 512KB；每台服务器会话上限 20 个
+
+## 许可证
+
+本项目尚未附带开源许可证（默认保留所有权利）。如需二次分发或商用，请先与作者取得联系。
