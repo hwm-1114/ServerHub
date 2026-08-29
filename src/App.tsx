@@ -288,14 +288,14 @@ function App() {
   }
 
   // ========== 本地终端(本机 PowerShell) ==========
-  // 在指定目录打开本地终端:同目录已存在则仅激活,不重复创建
+  // 在指定目录打开本地终端:每次都新建会话(同目录可开多个),已有会话通过标签栏切换。
   const openLocalTerminal = (cwd: string) => {
-    const existing = localSessions.find(s => s.local && s.cwd === cwd)
-    if (existing) { setActiveLocalSessionId(existing.id); return }
     const id = 'loc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7)
-    // 会话名取目录末级名,磁盘根层用"本地"
+    // 会话名取目录末级名,磁盘根层用"本地";同目录已有会话时追加序号便于区分标签
     const parts = cwd.split('\\').filter(Boolean)
-    const name = parts.length ? parts[parts.length - 1] : '本地'
+    const base = parts.length ? parts[parts.length - 1] : '本地'
+    const sameDir = localSessions.filter(s => s.local && s.cwd === cwd).length
+    const name = sameDir > 0 ? `${base} (${sameDir + 1})` : base
     const s: Session = { id, serverId: '__local__', name, local: true, cwd }
     setLocalSessions(prev => [...prev, s])
     setActiveLocalSessionId(id)

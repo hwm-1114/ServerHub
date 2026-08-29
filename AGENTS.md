@@ -26,6 +26,8 @@
 
 **本机传输可靠性修复（2026-08-28 批次 I，v1.2.1）**：本机↔远端互传与拖拽专项修复，11 项。后端：`local-to-remote`/`remote-to-local` 重构为 `runTransfer` 统一收尾——任一端出错 destroy 两端流+删半成品+`makeRespondOnce` 防双响应（旧实现读流出错写流永不 close，路由挂死成僵尸请求）；空闲 60s 无进展/总 30min 超时中止（SFTP 半开连接兜底）；完成后核对目标端大小与源端一致，不符删半成品报错（与 /files/upload 同标准）。`saveTransferState` 按文件互斥排队；`browseDirectory` 全异步（旧同步 stat 卡事件循环）。前端拖拽：`RemoteLocalPanel` 两处 `onDragOver` 改 `types` 判断（**dragover 期间 getData 恒为空**，旧实现高亮永不出现——LocalDirBrowser 早已修过此处漏改）；本机面板/本地终端列表对 DND_MIME 一律 `stopPropagation`（封闭投放区，旧实现本地文件掉在本机面板上会冒泡到根层被误上传远程并覆盖同名文件）；根层 `onDrop` 对落点在 `[data-localpanel]` 内的系统文件只提示不上传；`DownloadURL` 拖出追加 `withWsToken`；四处批量循环聚合每文件失败原因（旧 `catch{}` 只报 N/M）；拖拽含目录提示"已跳过"；批量下载完成 `refreshSignal` 通知本机面板刷新；面板关闭清空 `localPanelPath`。验证：tsc/build/lint(0 error)/离线矩阵 51 PASS（新增 R14 l2r 回环+缺失快速失败、R15 r2l 缺失+中途断流清理半成品）/真机传输冒烟 10 PASS（`.verify/transfer-smoke.mjs`）。**已知边界**：字节级进度需桌面版走 Electron IPC（Web 模式后端侧到侧拿不到浏览器文件句柄），列远期。
 
+**本地终端同目录多会话（2026-08-29，v1.2.2）**：`openLocalTerminal` 移除同目录去重（旧实现同目录已存在会话时仅激活不新建），每次点击「在此目录打开终端」都新建独立 PowerShell 会话；同目录第 2+ 个标签自动命名 `目录名 (2)`。后端本就按会话 id 各建 node-pty,无需改动。已浏览器实测:同目录双会话独立运行、输入互不串扰。
+
 **桌面版升级数据保留（用户强要求，已实测）**：所有运行数据写在 `%APPDATA%/ServerHub`（Electron userData，`main.cjs` 设 `SERVERHUB_DATA_DIR`），与安装目录完全隔离；NSIS 覆盖安装只替换安装目录文件。已实测"安装→种入服务器/命令数据→覆盖重装→数据完整保留"，且 `deleteAppDataOnUninstall: false` 保证卸载也不删数据。
 
 ## 项目概述
