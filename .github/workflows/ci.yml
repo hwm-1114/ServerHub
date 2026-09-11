@@ -159,5 +159,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --title "ServerHub $tag" --generate-notes
           }
-          gh release upload $tag release/*.exe release/*.blockmap --clobber
+          # PowerShell 不对原生命令做通配符展开(会把 release/*.exe 原样传给 gh),
+          # 所以这里自己把文件列出来再逐个传参,避免"找不到文件"的发版失败。
+          $files = @(Get-ChildItem -Path release -File | Where-Object { $_.Extension -in '.exe', '.blockmap' } | ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) { Write-Error 'release/ 下没有可上传的安装包产物'; exit 1 }
+          gh release upload $tag $files --clobber
           gh release view $tag --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
