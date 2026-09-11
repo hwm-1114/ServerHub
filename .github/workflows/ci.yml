@@ -108,8 +108,11 @@ jobs:
           SH_USER: ${{ secrets.SH_USER }}
           SH_PASS: ${{ secrets.SH_PASS }}
         run: npm run audit:desktop
+      # 必须显式 --publish never(已封装进 npm run dist:nsis):electron-builder 检测到 CI
+      # 环境、又能从 git remote 推断出 GitHub provider 时会**隐式尝试发布 Release**,没有
+      # GH_TOKEN 就直接以 exit 1 失败(安装包其实已经生成)——本工作流的发版是自己用 gh 做的。
       - name: 生成 NSIS 安装包
-        run: npx electron-builder --win nsis
+        run: npm run dist:nsis
       # 静默安装 → 启动已安装的应用 → 种数据 → 覆盖安装 → 数据仍在 → 静默卸载 → 数据保留
       - name: 安装包回归(audit:installer)
         run: npm run audit:installer

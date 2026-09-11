@@ -81,7 +81,11 @@ ok(idxBuild >= 0 && idxBuild < idxUi, 'test 任务先 npm run build 再 audit:ui
 const pkgRuns = runList('package')
 ok(pkgRuns.findIndex(r => /npm run app/.test(r)) < pkgRuns.findIndex(r => /audit:desktop|audit:installer/.test(r)),
   'package 任务先出包再跑打包版/安装包回归')
-ok(/electron-builder --win nsis/.test(pkgRuns.join('\n')), 'package 任务生成 NSIS 安装包')
+ok(/npm run dist:nsis/.test(pkgRuns.join('\n')), 'package 任务用 npm run dist:nsis 生成安装包')
+// electron-builder 检测到 CI 环境、又能从 git remote 推断出 GitHub provider 时会**隐式尝试
+// 发布 Release**,没有 GH_TOKEN 就直接 exit 1(安装包其实已经生成)——出包命令必须显式禁用发布。
+ok(/--publish never/.test(scripts['dist:nsis'] || ''), 'dist:nsis 带 --publish never(防 CI 隐式发布)')
+ok(/--publish never/.test(scripts.app || ''), 'npm run app 也带 --publish never')
 ok(!runList('release').some(r => /audit:|npm test/.test(r)), 'release 任务只做版本校验与上传,不重复跑回归')
 
 // 发版细节:PowerShell 不对原生命令展开通配符,`gh release upload release/*.exe` 会把字面量传给 gh,

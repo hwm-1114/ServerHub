@@ -1,14 +1,19 @@
 // 安装包(NSIS)验证:静默安装 → 启动已安装的应用 → 种入数据 → 覆盖安装 → 数据仍在 → 静默卸载。
 // 用 --user-data-dir 把 userData 指到临时目录,避免碰真实的 %APPDATA%/ServerHub。
-// 用法: node scripts/installer-audit.mjs   (需先 npx electron-builder --win nsis 出包)
+// 用法: npm run dist:nsis   (先出包;等价于 npx electron-builder --win nsis --publish never)
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { spawn, spawnSync } from 'child_process'
 
 const relDir = path.join(process.cwd(), 'release')
-const installer = fs.readdirSync(relDir).find(f => /^ServerHub Setup .*\.exe$/.test(f))
-if (!installer) { console.error('release/ 下没有安装包,请先运行 npx electron-builder --win nsis'); process.exit(2) }
+// 出包中途会生成临时卸载器 `ServerHub Setup <ver>.__uninstaller.exe`,打包失败时会残留;
+// 它的文件名同样匹配 "ServerHub Setup *.exe",必须排除,并取最新一个,否则会拿卸载器当安装包。
+const installer = fs.readdirSync(relDir)
+  .filter(f => /^ServerHub Setup .*\.exe$/.test(f) && !f.includes('__uninstaller'))
+  .map(f => ({ f, mtime: fs.statSync(path.join(relDir, f)).mtimeMs }))
+  .sort((a, b) => b.mtime - a.mtime)[0]?.f
+if (!installer) { console.error('release/ 下没有安装包,请先运行 npm run dist:nsis'); process.exit(2) }
 const INSTALLER = path.join(relDir, installer)
 const INSTALL_DIR = path.join(os.tmpdir(), `sh-install-${Date.now()}`)
 const DATA_DIR = path.join(os.tmpdir(), `sh-appdata-${Date.now()}`)
