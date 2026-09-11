@@ -51,6 +51,11 @@ let pass = 0, fail = 0
 const ok = (cond, label) => { if (cond) pass++; else { fail++; console.log('  ❌', label) } }
 const alive = () => child.exitCode === null && child.signalCode === null
 
+// 收尾护栏:测试脚本自身出现未处理的 rejection(例如误把 Promise 传给 cls,请求变成"发射后不管")
+// 时,不要以一句 stack 崩掉了事——打印出来并计入失败,避免"断言全过却 exit 1"这种看不懂的结果
+// (CI 上真发生过:本地不报是因为本地请求都会正常返回,CI 上子进程被杀时的 ECONNRESET 才会暴露)。
+process.on('unhandledRejection', (e) => { fail++; console.log('  ❌ 测试脚本出现未处理的 rejection:', (e && e.message) || e) })
+
 // 带超时的 fetch
 async function jfetch(url, opts = {}) {
   const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 15000)
@@ -62,7 +67,14 @@ const HELPERS = {
   down: (i) => jfetch(`${BASE}/api/servers/srv-r/files/remote-to-local`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ remotePath: `/remotedir/f${i % 5}.txt`, localDir: dstDir }) }),
 }
 const CH = (r) => (r && r.error && /channel open failure/i.test(String(r.error)))
-async function cls(fn) { try { const r = await fn(); return CH(r) ? { ch: true } : { ch: false, r } } catch (e) { return { ch: false, err: e && e.message } } }
+// 归类:通道失败=预期自动恢复;其余=真实意外错误
+// 注意:必须传【函数】(惰性执行),传 Promise 会让 await fn() 立刻抛 "fn is not a function"
+// ——请求变成没人管的"发射后不管",既测不到结果,失败时还会变成未处理的 rejection
+// (CI 上就是这样把整个脚本以 exit 1 打挂的:断言全过、收尾却崩)。这里直接拦下来。
+async function cls(fn) {
+  if (typeof fn !== 'function') throw new Error('cls() 需要传函数(如 () => HELPERS.list()),不能传 Promise')
+  try { const r = await fn(); return CH(r) ? { ch: true } : { ch: false, r } } catch (e) { return { ch: false, err: e && e.message } }
+}
 
 function openWS(url) {
   return new Promise((res) => {
@@ -90,7 +102,7 @@ console.log('\n[阶段1] 6 常驻远程会话 + 本地终端;40 轮文件传输;
   for (let i = 0; i < 40; i++) {
     if (i % 13 === 4) { // 注入文件连接通道耗尽(由守卫兜底,只重连文件连接)
       // 用一连串并发传输压垮假文件连接并触发重连
-      for (let k = 0; k < 6; k++) { const r = await cls(HELPERS.down(i)); if (r.ch) chCount++; else if (r.err || (r.r && r.r.error)) errUnexpected++ }
+      for (let k = 0; k < 6; k++) { const r = await cls(() => HELPERS.down(i)); if (r.ch) chCount++; else if (r.err || (r.r && r.r.error)) errUnexpected++ }
     }
     for (const fn of [HELPERS.list, () => HELPERS.up(i), () => HELPERS.down(i)]) { const x = await cls(fn); if (x.ch) chCount++; else if (x.err || (x.r && x.r.error)) errUnexpected++ }
     if (!alive()) { console.log('        >>> 崩溃:阶段1 中途进程退出!'); break }
@@ -135,9 +147,17 @@ console.log('\n[阶段2] 恶意的 WS 消息 / 坏路径 / 空请求体…')
 console.log('\n[阶段3] 突发并发:同时开 30 个会话 + 同时 30 次文件请求…')
 {
   const many = await Promise.all(Array.from({ length: 30 }, (_, i) => openWS(`ws://localhost:${PORT}/ws/terminal?serverId=srv-r&session=burst${i}`)))
-  await Promise.all(Array.from({ length: 30 }, (_, i) => cls(HELPERS.list).then(() => cls(HELPERS.up(i)).then(() => cls(HELPERS.down(i))))))
+  // 注意:每个 cls() 都要传函数,串行地跑"列目录 → 上传 → 下载",并真正 await 到结果
+  let burstUnexpected = 0
+  const oneChain = async (i) => {
+    for (const fn of [() => HELPERS.list(), () => HELPERS.up(i), () => HELPERS.down(i)]) {
+      const x = await cls(fn)
+      if (x.err || (x.r && x.r.error)) burstUnexpected++
+    }
+  }
+  await Promise.all(Array.from({ length: 30 }, (_, i) => oneChain(i)))
   await sleep(200)
-  ok(alive(), `30 会话 + 30 并发文件请求突发后进程仍存活`)
+  ok(alive(), `30 会话 + 30 并发文件请求突发后进程仍存活(意外错误 ${burstUnexpected})`)
   many.forEach(m => m.ws.close())
   await sleep(100)
 }

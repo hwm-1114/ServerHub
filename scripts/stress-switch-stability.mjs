@@ -143,7 +143,10 @@ const HELPERS = {
   }),
 }
 // 归类:通道失败=预期自动恢复;其余=真实意外错误
+// 注意:必须传【函数】(惰性执行)——传 Promise 会让 await fn() 抛 "fn is not a function",
+// 请求变成"发射后不管":测不到结果,失败时还会变成未处理的 rejection 打挂脚本。
 async function cls(fn) {
+  if (typeof fn !== 'function') throw new Error('cls() 需要传函数(如 () => HELPERS.up(i)),不能传 Promise')
   try {
     const r = await fn()
     if (r && r.error && !CHANNEL_RE.test(String(r.error))) return { unexpected: true, msg: r.error }
@@ -244,7 +247,7 @@ for (let i = 0; i < ROUNDS; i++) {
 
 // ========== 4) 切换停止后仍持续传输一小段,确认会话保持 ==========
 await sleep(300)
-for (let i = 0; i < 3; i++) { await cls(HELPERS.up(i)); await cls(HELPERS.down(i)) }
+for (let i = 0; i < 3; i++) { await cls(() => HELPERS.up(i)); await cls(() => HELPERS.down(i)) }
 
 // ========== 5) 验收断言 ==========
 console.log('\n结果:')

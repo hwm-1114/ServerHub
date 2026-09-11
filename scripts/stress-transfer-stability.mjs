@@ -155,7 +155,10 @@ console.log(`开始压力循环:${ROUNDS} 轮上传/下载/列目录,并在 ${EX
 let errCount = 0       // 真正意外的错误(读/写/连接等真实失败)
 const CHANNEL_RE = /channel open failure/i
 // 返回 {unexpected:boolean} 归类:通道失败=预期自动恢复;其余=真实错误
+// 注意:必须传【函数】(惰性执行)——传 Promise 会让 await fn() 抛 "fn is not a function",
+// 请求变成"发射后不管":测不到结果,失败时还会变成未处理的 rejection 打挂脚本。
 async function cls(fn) {
+  if (typeof fn !== 'function') throw new Error('cls() 需要传函数(如 () => HELPERS.up(i)),不能传 Promise')
   try {
     const r = await fn()
     if (r && r.error && !CHANNEL_RE.test(String(r.error))) return { unexpected: true, msg: r.error }
