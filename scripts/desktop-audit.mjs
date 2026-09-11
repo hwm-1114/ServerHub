@@ -111,7 +111,22 @@ async function main() {
   const cdp = makeCdp(wsUrl)
   await cdp.ready
   await cdp.send('Runtime.enable')
-  await sleep(1500)
+  // 关键:CDP 目标一出现就可能被 `/json/list` 报到(此时 URL 已是 http://localhost:33120,
+  // 但文档还是初始的 about:blank,导航尚未提交)。CI 上机器慢,固定 sleep 会 snapshot 到空白页,
+  // 于是"界面已渲染"误判失败——这里必须轮询等真正的文档就绪,再注入 HELPERS
+  // (提前注入会随导航被清掉)。
+  const pageState = async () => {
+    try {
+      return await cdp.evaluate(`({ href: location.href, rs: document.readyState, mounted: !!document.querySelector('#root')?.children.length })`)
+    } catch { return null } // 导航中执行上下文会被销毁,treat as not ready
+  }
+  let st = null
+  for (let i = 0; i < 100; i++) {
+    st = await pageState()
+    if (st && st.rs === 'complete' && String(st.href).includes(String(APP_PORT)) && st.mounted) break
+    await sleep(300)
+  }
+  if (!st || !st.mounted) console.log(`     (页面就绪等待超时: ${JSON.stringify(st)})`)
   await cdp.evaluate(HELPERS)
   const snap = () => cdp.evaluate(`window.__d.snap()`)
 

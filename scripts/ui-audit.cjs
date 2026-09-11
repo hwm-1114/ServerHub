@@ -138,7 +138,22 @@ async function main() {
   const js = (code) => win.webContents.executeJavaScript(code)
   const wait = (ms = 500) => new Promise(r => setTimeout(r, ms))
   const counts = () => js(`window.__t.counts()`)
-  const reload = async () => { await win.loadURL(`http://127.0.0.1:${PORT}/`); await wait(1400); await js(HELPERS) }
+  // loadURL 的 resolve 只代表 load 事件,React 挂载还在其后;固定 sleep 在慢机器(CI)上会 snapshot 到
+  // 还没渲染的空壳,于是断言集体失败。改成轮询等 #root 真的有子节点,再注入 HELPERS。
+  const waitMounted = async (ms = 15000) => {
+    const deadline = Date.now() + ms
+    while (Date.now() < deadline) {
+      const mounted = await js('!!document.querySelector("#root")?.children.length').catch(() => false)
+      if (mounted) return true
+      await wait(200)
+    }
+    return false
+  }
+  const reload = async () => {
+    await win.loadURL(`http://127.0.0.1:${PORT}/`)
+    if (!await waitMounted()) console.log('     (等待界面挂载超时,后续断言可能失败)')
+    await js(HELPERS)
+  }
   const api = (p, init) => fetch(API + p, init).then(async r => ({ status: r.status, body: await r.json().catch(() => null) }))
   const jpost = (p, b) => api(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) })
 
