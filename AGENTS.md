@@ -60,7 +60,10 @@
 - **把本机文件拖到远程文件列表 = 上传成功**（合成 OS 拖放 → 真实 SFTP 写入远端，已核对远端条目）；
 - **把文件拖到侧栏 / 终端区（非投放区）后窗口仍停在 `http://localhost:33120/`，没有被 `file://` 导航替换**（`will-navigate` 守卫 + 根层 dragover/drop 兜底在打包版生效）；
 - 断开连接后会话标签仍在、不退回空状态（批次 M 的打包版回归）；单实例锁：第二个实例 exit 0 自行退出，第一个实例后端仍正常服务。
-**已知未自动化**：① **文件夹**拖拽的递归展开（`webkitGetAsEntry`）无法用 CDP 合成（合成拖放只带文件列表，走的是 `dt.files` 兜底分支）——该路径由 `scripts/verify-drag-paths.mjs`（9 断言，忠实模拟 FileSystemEntry）+ 真机 `audit:real` 的"mkdir existOk + 嵌套上传"共同覆盖，残余风险是"真实资源管理器拖目录时 relPath 的实际形态"；② NSIS 安装包安装/卸载流程仍是人工步骤（`deleteAppDataOnUninstall:false` 的数据保留已人工实测过）。**踩坑**：GUI 版审计里 `innerText` 读不到 `display:none` 里的内容——会话标签位于终端层，切到"文件"页签后整层被隐藏，必须先切回"终端"页签再断言标签数量。
+**已知未自动化**：**文件夹**拖拽的递归展开（`webkitGetAsEntry`）无法用 CDP 合成（合成拖放只带文件列表，走的是 `dt.files` 兜底分支）——该路径由 `scripts/verify-drag-paths.mjs`（9 断言，忠实模拟 FileSystemEntry）+ 真机 `audit:real` 的"mkdir existOk + 嵌套上传"共同覆盖，残余风险是"真实资源管理器拖目录时 relPath 的实际形态"。**踩坑**：GUI 版审计里 `innerText` 读不到 `display:none` 里的内容——会话标签位于终端层，切到"文件"页签后整层被隐藏，必须先切回"终端"页签再断言标签数量。
+
+**安装包(NSIS)自动化验证（2026-09-11，随批次 N）**：`npx electron-builder --win nsis` → `release/ServerHub Setup <version>.exe`（约 104MB），`npm run audit:installer`（`scripts/installer-audit.mjs`，18 断言）已把此前的人工步骤自动化：`/S /D=<临时目录>` 静默安装 → 校验 `ServerHub.exe`/`app.asar`/`app.asar.unpacked/node_modules/node-pty` 就位 → 启动已安装的应用（内置后端 33120 就绪）→ 通过 API 种入服务器(含明文密码)与会话记录 → **再次覆盖安装** → 记录仍在 → `Uninstall ServerHub.exe /S` 静默卸载 → 程序删除而 **userData 数据保留**。安装包文件名/版本取自 `package.json` 的 `version`，**发版前记得同步版本号**（本次由 1.2.2 → 1.3.2）。
+**发布到 GitHub（2026-09-11）**：源码推送到 `https://github.com/hwm-1114/ServerHub`（`main`），安装包以 **Release 资产**发布（tag `v1.3.2`）。**踩坑**：① 本机 git 全局配置了 `http.proxy=http://127.0.0.1:7890`，代理客户端没开时 `git fetch/push` 会直接失败——一次性覆盖即可：`git -c http.proxy= push <url> main`；② 仓库 remote URL 里曾内嵌明文 token（已改为不含 token 的纯 URL，**别再写回去**，改用凭据管理器）；③ `.gitignore` 已排除 `data/`（真实服务器明文密码）、`.verify/`（含凭据的临时脚本）、`release/`、`dist/`——**推送前务必复查 `git status` 确认这三类没被跟踪**。
 
 **本地终端同目录多会话（2026-08-29，v1.2.2）**：`openLocalTerminal` 移除同目录去重（旧实现同目录已存在会话时仅激活不新建），每次点击「在此目录打开终端」都新建独立 PowerShell 会话；同目录第 2+ 个标签自动命名 `目录名 (2)`。后端本就按会话 id 各建 node-pty,无需改动。已浏览器实测:同目录双会话独立运行、输入互不串扰。
 
@@ -98,6 +101,7 @@ ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌�
 | `npm run audit:real` | **真机回归**：`scripts/real-audit.mjs`，27 断言；凭据走 `SH_HOST/SH_USER/SH_PASS` 环境变量，未设置自动跳过 |
 | `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），16 断言：新建服务器/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载 |
 | `npm run audit:desktop` | **打包版 GUI 回归**：`scripts/desktop-audit.mjs`（对 `release/win-unpacked/ServerHub.exe` 用 CDP 驱动 + `Input.dispatchDragEvent` 合成真实拖放），15 断言：内置后端/数据目录、界面建服务器并连真机、**拖文件到远程列表=上传**、**拖到侧栏/终端区不导航走**、断开后会话仍在、单实例锁 |
+| `npm run audit:installer` | **安装包回归**：`scripts/installer-audit.mjs`（NSIS 静默安装 → 启动 → 种数据 → **覆盖安装** → 数据仍在 → 静默卸载 → 数据保留），18 断言；需先 `npx electron-builder --win nsis` |
 
 ## 架构红线（改动前必读，均在 allfiles.md 有详细注释）
 
