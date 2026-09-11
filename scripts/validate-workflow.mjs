@@ -59,7 +59,14 @@ ok(ifSteps >= 1, `条件步骤 ${ifSteps} 个(如 release 只在标签上跑)`)
 ok(jobs.release?.permissions?.contents === 'write', 'release 任务声明 contents: write(上传资产需要)')
 ok(jobs.release?.if?.includes("refs/tags/v"), 'release 任务只在标签上运行')
 ok((jobs.package?.needs === 'test'), 'package 依赖 test(回归不过不出包)')
-ok((jobs.release?.needs === 'package'), 'release 依赖 package')
+// static 与 package 是兄弟任务:若 release 只依赖 package,typecheck/lint/build 挂了照样能发版
+const releaseNeeds = Array.isArray(jobs.release?.needs) ? jobs.release.needs : [jobs.release?.needs]
+ok(releaseNeeds.includes('static') && releaseNeeds.includes('package'), 'release 同时依赖 static 与 package', releaseNeeds.join(', '))
+
+// 每个任务都要有超时:否则卡死时最长挂 6 小时(出包/安装包回归会启动真实进程)
+const noTimeout = Object.entries(jobs).filter(([, j]) => !j['timeout-minutes']).map(([id]) => id)
+ok(noTimeout.length === 0, '所有任务都设了 timeout-minutes', noTimeout.length ? `缺: ${noTimeout.join(', ')}` : Object.entries(jobs).map(([id, j]) => `${id}=${j['timeout-minutes']}min`).join('; '))
+ok((jobs.static?.steps || []).some(s => /npm run validate:workflow/.test(s.run || '')), 'static 任务跑工作流自校验(改坏工作流先在这里拦下)')
 
 // 表达式配对
 const opens = (raw.match(/\$\{\{/g) || []).length
@@ -95,7 +102,12 @@ const ghWithGlob = releaseSteps.filter(s => s.shell === 'pwsh' && /gh\s+release[
 ok(ghWithGlob.length === 0, 'pwsh 步骤不把通配符直接交给 gh(需自己列文件)', ghWithGlob.length ? '发现 glob 传参' : 'release 用 Get-ChildItem 列文件')
 const uploadStep = releaseSteps.find(s => /gh release upload/.test(s.run || ''))?.run || ''
 ok(/\.blockmap/.test(uploadStep) && /\.exe/.test(uploadStep), '上传安装包与 blockmap 两个产物')
+ok(/__uninstaller/.test(uploadStep), '上传时排除出包中途的临时卸载器(ServerHub Setup <ver>.__uninstaller.exe)')
+ok(/\$LASTEXITCODE/.test(uploadStep), 'gh 的退出码被检查(否则上传失败会被后面的 view 掩盖成绿色)')
+ok(/assets/.test(uploadStep) && /missing/i.test(uploadStep), '上传后核对资产确实出现在 Release 里')
+ok(/isDraft/.test(uploadStep), '检查并取消 Release 草稿状态(防误注入 GH_TOKEN 时 electron-builder 抢先建 draft)')
 ok(releaseSteps.some(s => /package\.json/.test(s.run || '') && /version/.test(s.run || '')), 'release 校验标签与 package.json 版本一致')
+ok(/if-no-files-found/.test(JSON.stringify(jobs.package?.steps || [])), 'upload-artifact 设了 if-no-files-found(出包失败不会静默通过)')
 
 console.log('\n' + '='.repeat(52))
 console.log(`工作流校验: ${pass} PASS / ${fail} FAIL`)

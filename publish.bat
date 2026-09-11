@@ -51,8 +51,10 @@ if errorlevel 1 (
 )
 
 rem 3) 用 electron-builder 生成应用(展开目录,非安装包)
-echo [step 3/4] packaging Windows app (electron-builder --dir)...
-call npx electron-builder --dir
+rem --publish never 必须保留:在设置了 CI 环境变量的机器上,electron-builder 会从 git remote
+rem 推断出 GitHub provider 并**隐式尝试发布 Release**,没有 GH_TOKEN 就直接失败
+echo [step 3/4] packaging Windows app (electron-builder --dir --publish never)...
+call npx electron-builder --dir --publish never
 if errorlevel 1 (
   echo ERROR: packaging failed, see error above.
   pause

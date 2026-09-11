@@ -8,11 +8,13 @@ import { spawn, spawnSync } from 'child_process'
 
 const relDir = path.join(process.cwd(), 'release')
 // 出包中途会生成临时卸载器 `ServerHub Setup <ver>.__uninstaller.exe`,打包失败时会残留;
-// 它的文件名同样匹配 "ServerHub Setup *.exe",必须排除,并取最新一个,否则会拿卸载器当安装包。
-const installer = fs.readdirSync(relDir)
+// 它的文件名同样匹配 "ServerHub Setup *.exe",必须排除。版本号优先取 package.json 里的当前版本
+// (release/ 里躺着旧版本 exe 时,"取最新 mtime"仍可能挑错),取不到再退回最新的一个。
+const curVersion = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')).version
+const candidates = fs.readdirSync(relDir)
   .filter(f => /^ServerHub Setup .*\.exe$/.test(f) && !f.includes('__uninstaller'))
   .map(f => ({ f, mtime: fs.statSync(path.join(relDir, f)).mtimeMs }))
-  .sort((a, b) => b.mtime - a.mtime)[0]?.f
+const installer = (candidates.find(c => c.f === `ServerHub Setup ${curVersion}.exe`) ?? candidates.sort((a, b) => b.mtime - a.mtime)[0])?.f
 if (!installer) { console.error('release/ 下没有安装包,请先运行 npm run dist:nsis'); process.exit(2) }
 const INSTALLER = path.join(relDir, installer)
 const INSTALL_DIR = path.join(os.tmpdir(), `sh-install-${Date.now()}`)
