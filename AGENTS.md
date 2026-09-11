@@ -65,6 +65,8 @@
 **安装包(NSIS)自动化验证（2026-09-11，随批次 N）**：`npx electron-builder --win nsis` → `release/ServerHub Setup <version>.exe`（约 104MB），`npm run audit:installer`（`scripts/installer-audit.mjs`，18 断言）已把此前的人工步骤自动化：`/S /D=<临时目录>` 静默安装 → 校验 `ServerHub.exe`/`app.asar`/`app.asar.unpacked/node_modules/node-pty` 就位 → 启动已安装的应用（内置后端 33120 就绪）→ 通过 API 种入服务器(含明文密码)与会话记录 → **再次覆盖安装** → 记录仍在 → `Uninstall ServerHub.exe /S` 静默卸载 → 程序删除而 **userData 数据保留**。安装包文件名/版本取自 `package.json` 的 `version`，**发版前记得同步版本号**（本次由 1.2.2 → 1.3.2）。
 **发布到 GitHub（2026-09-11）**：源码推送到 `https://github.com/hwm-1114/ServerHub`（`main`），安装包以 **Release 资产**发布（tag `v1.3.2`）。**踩坑**：① 本机 git 全局配置了 `http.proxy=http://127.0.0.1:7890`，代理客户端没开时 `git fetch/push` 会直接失败——一次性覆盖即可：`git -c http.proxy= push <url> main`；② 仓库 remote URL 里曾内嵌明文 token（已改为不含 token 的纯 URL，**别再写回去**，改用凭据管理器）；③ `.gitignore` 已排除 `data/`（真实服务器明文密码）、`.verify/`（含凭据的临时脚本）、`release/`、`dist/`——**推送前务必复查 `git status` 确认这三类没被跟踪**。
 
+**持续集成（2026-09-11，`.github/workflows/ci.yml`）**：四个任务——`static`（ubuntu：`npm ci --ignore-scripts` + typecheck/lint/build，**必须 `--ignore-scripts`**：node-pty 只发布 darwin/win32 预编译，Linux 上会退化成 node-gyp 全量编译，而这三步都不加载 node-pty；esbuild 平台包在 `optionalDependencies`，不受影响）、`test`（windows：`npm test` + `audit:ui`，配了 `SH_*` secrets 才跑 `audit:real` 且 `continue-on-error`）、`package`（windows：`npm run app` → `audit:desktop` → NSIS → `audit:installer`，上传安装包产物）、`release`（`v*` 标签才跑：**先校验 `v<tag>` 与 `package.json` 的 `version` 一致**再用 `gh release` 建 Release 并 `--clobber` 上传，避免"标签是 v1.3.2、包里装的是 1.2.2"）。写工作流时注意 `concurrency.cancel-in-progress` 按 ref 分组：**同一分支连续推送会取消上一次运行**（`audit:desktop`/`audit:installer` 在内网真机上会跳过真机断言而不是失败，所以 CI 无 secrets 也能全绿）。工作流本身用 `npm run validate:workflow`（`scripts/validate-workflow.mjs`，30 断言，纯文本解析 YAML，不引入依赖）离线校验。
+
 **本地终端同目录多会话（2026-08-29，v1.2.2）**：`openLocalTerminal` 移除同目录去重（旧实现同目录已存在会话时仅激活不新建），每次点击「在此目录打开终端」都新建独立 PowerShell 会话；同目录第 2+ 个标签自动命名 `目录名 (2)`。后端本就按会话 id 各建 node-pty,无需改动。已浏览器实测:同目录双会话独立运行、输入互不串扰。
 
 **桌面版升级数据保留（用户强要求，已实测）**：所有运行数据写在 `%APPDATA%/ServerHub`（Electron userData，`main.cjs` 设 `SERVERHUB_DATA_DIR`），与安装目录完全隔离；NSIS 覆盖安装只替换安装目录文件。已实测"安装→种入服务器/命令数据→覆盖重装→数据完整保留"，且 `deleteAppDataOnUninstall: false` 保证卸载也不删数据。
@@ -99,9 +101,10 @@ ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌�
 | `npm run lint` | `eslint src server scripts electron`（当前 0 error / 88 warning，warning 作改进清单） |
 | `npm test` | 一键串跑：五个旧脚本 + `verify-fullhistory` + 可靠性矩阵 51 条 + 批次 J/K/L 新增的三个离线回归（verify-fixes 26 / verify-drag-paths 9 / verify-ansi-html 10） |
 | `npm run audit:real` | **真机回归**：`scripts/real-audit.mjs`，27 断言；凭据走 `SH_HOST/SH_USER/SH_PASS` 环境变量，未设置自动跳过 |
-| `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），16 断言：新建服务器/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载 |
+| `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），16 断言：新建服务器/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载；**需先 `npm run build`**（加载的是真实前端产物，缺 `dist/` 会明确报错退出 2），断言失败退出码 1 |
 | `npm run audit:desktop` | **打包版 GUI 回归**：`scripts/desktop-audit.mjs`（对 `release/win-unpacked/ServerHub.exe` 用 CDP 驱动 + `Input.dispatchDragEvent` 合成真实拖放），15 断言：内置后端/数据目录、界面建服务器并连真机、**拖文件到远程列表=上传**、**拖到侧栏/终端区不导航走**、断开后会话仍在、单实例锁 |
 | `npm run audit:installer` | **安装包回归**：`scripts/installer-audit.mjs`（NSIS 静默安装 → 启动 → 种数据 → **覆盖安装** → 数据仍在 → 静默卸载 → 数据保留），18 断言；需先 `npx electron-builder --win nsis` |
+| `npm run validate:workflow` | 离线校验 `.github/workflows/ci.yml`（30 断言：任务/触发/secrets 用法/版本一致性检查/`--ignore-scripts` 等），改工作流后跑一次 |
 
 ## 架构红线（改动前必读，均在 allfiles.md 有详细注释）
 

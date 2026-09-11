@@ -99,12 +99,30 @@ ServerHub 定位为**运行在本机 / 内网的个人工具**，以下几点是
 ## 开发
 
 ```bash
-npm test            # 一键回归:7 个离线脚本(会话隔离/20 并发/传输自愈/切换稳定/进程不崩/完整历史重建/可靠性矩阵 51 断言)
-npm run typecheck   # tsc --noEmit
-npm run lint        # eslint
+npm test              # 一键离线回归:10 个脚本(会话隔离/20 并发/传输自愈/切换稳定/进程不崩/完整历史重建/
+                      #   可靠性矩阵 51 断言/批次 J-K-L 三个专项 45 断言)
+npm run typecheck     # tsc --noEmit
+npm run lint          # eslint
+npm run audit:real    # 真机回归(27 断言;凭据走 SH_HOST/SH_USER/SH_PASS 环境变量,未设置自动跳过)
+npm run audit:ui      # 界面级回归(16 断言;Electron 隐藏窗口真实驱动 UI,假 ssh2)
+npm run audit:desktop # 打包版回归(15 断言;CDP 驱动 release/win-unpacked/ServerHub.exe + 合成 OS 拖放)
+npm run audit:installer # 安装包回归(18 断言;静默安装→覆盖安装数据保留→静默卸载)
 ```
 
 离线脚本通过伪造 ssh2 Client 与内存文件系统运行，不需要真实服务器。
+
+### 持续集成
+
+`.github/workflows/ci.yml` 在每次推 `main` / PR 时跑四个任务：
+
+| 任务 | 运行环境 | 内容 |
+|---|---|---|
+| 静态检查 | Linux | `typecheck` → `lint` → `build`（`npm ci --ignore-scripts`：node-pty 无 linux-x64 预编译，而这三步都不加载它） |
+| 离线回归 | Windows | `npm test` + `audit:ui`（目标平台）；配置了 `SH_HOST/SH_USER/SH_PASS` secrets 时额外跑 `audit:real`，外部机器不可用不阻断 CI |
+| 出包 + 验证 | Windows | `npm run app` → `audit:desktop` → NSIS 出包 → `audit:installer`，上传安装包产物 |
+| 发布 | Windows | 仅 `v*` 标签：校验标签与 `package.json` 版本一致，创建 Release 并上传安装包 |
+
+手动触发用 `workflow_dispatch`；仓库 secrets 里配 `SH_HOST`/`SH_USER`/`SH_PASS` 可让 CI 顺带跑真机回归。
 
 ### 架构一览
 

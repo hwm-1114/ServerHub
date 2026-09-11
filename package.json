@@ -23,7 +23,8 @@
     "audit:real": "node scripts/real-audit.mjs",
     "audit:ui": "electron scripts/ui-audit.cjs",
     "audit:desktop": "node scripts/desktop-audit.mjs",
-    "audit:installer": "node scripts/installer-audit.mjs"
+    "audit:installer": "node scripts/installer-audit.mjs",
+    "validate:workflow": "node scripts/validate-workflow.mjs"
   },
   "build": {
     "appId": "com.serverhub.app",
