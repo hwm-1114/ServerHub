@@ -62,10 +62,10 @@
 - 断开连接后会话标签仍在、不退回空状态（批次 M 的打包版回归）；单实例锁：第二个实例 exit 0 自行退出，第一个实例后端仍正常服务。
 **已知未自动化**：**文件夹**拖拽的递归展开（`webkitGetAsEntry`）无法用 CDP 合成（合成拖放只带文件列表，走的是 `dt.files` 兜底分支）——该路径由 `scripts/verify-drag-paths.mjs`（9 断言，忠实模拟 FileSystemEntry）+ 真机 `audit:real` 的"mkdir existOk + 嵌套上传"共同覆盖，残余风险是"真实资源管理器拖目录时 relPath 的实际形态"。**踩坑**：GUI 版审计里 `innerText` 读不到 `display:none` 里的内容——会话标签位于终端层，切到"文件"页签后整层被隐藏，必须先切回"终端"页签再断言标签数量。
 
-**安装包(NSIS)自动化验证（2026-09-11，随批次 N）**：`npx electron-builder --win nsis` → `release/ServerHub Setup <version>.exe`（约 104MB），`npm run audit:installer`（`scripts/installer-audit.mjs`，18 断言）已把此前的人工步骤自动化：`/S /D=<临时目录>` 静默安装 → 校验 `ServerHub.exe`/`app.asar`/`app.asar.unpacked/node_modules/node-pty` 就位 → 启动已安装的应用（内置后端 33120 就绪）→ 通过 API 种入服务器(含明文密码)与会话记录 → **再次覆盖安装** → 记录仍在 → `Uninstall ServerHub.exe /S` 静默卸载 → 程序删除而 **userData 数据保留**。安装包文件名/版本取自 `package.json` 的 `version`，**发版前记得同步版本号**（本次由 1.2.2 → 1.3.2）。
+**安装包(NSIS)自动化验证（2026-09-11，随批次 N）**：`npm run dist:nsis`（= `electron-builder --win nsis --publish never`，**别再用裸 `npx electron-builder --win nsis`**：CI 环境下它会隐式尝试发布 Release）→ `release/ServerHub Setup <version>.exe`（约 104MB），`npm run audit:installer`（`scripts/installer-audit.mjs`，18 断言）已把此前的人工步骤自动化：`/S /D=<临时目录>` 静默安装 → 校验 `ServerHub.exe`/`app.asar`/`app.asar.unpacked/node_modules/node-pty` 就位 → 启动已安装的应用（内置后端 33120 就绪）→ 通过 API 种入服务器(含明文密码)与会话记录 → **再次覆盖安装** → 记录仍在 → `Uninstall ServerHub.exe /S` 静默卸载 → 程序删除而 **userData 数据保留**。安装包文件名/版本取自 `package.json` 的 `version`，**发版前记得同步版本号**（本次由 1.2.2 → 1.3.2）。
 **发布到 GitHub（2026-09-11）**：源码推送到 `https://github.com/hwm-1114/ServerHub`（`main`），安装包以 **Release 资产**发布（tag `v1.3.2`）。**踩坑**：① 本机 git 全局配置了 `http.proxy=http://127.0.0.1:7890`，代理客户端没开时 `git fetch/push` 会直接失败——一次性覆盖即可：`git -c http.proxy= push <url> main`；② 仓库 remote URL 里曾内嵌明文 token（已改为不含 token 的纯 URL，**别再写回去**，改用凭据管理器）；③ `.gitignore` 已排除 `data/`（真实服务器明文密码）、`.verify/`（含凭据的临时脚本）、`release/`、`dist/`——**推送前务必复查 `git status` 确认这三类没被跟踪**。
 
-**持续集成（2026-09-11，`.github/workflows/ci.yml`）**：四个任务——`static`（ubuntu：`npm ci --ignore-scripts` + typecheck/lint/build，**必须 `--ignore-scripts`**：node-pty 只发布 darwin/win32 预编译，Linux 上会退化成 node-gyp 全量编译，而这三步都不加载 node-pty；esbuild 平台包在 `optionalDependencies`，不受影响）、`test`（windows：`npm test` + `audit:ui`，配了 `SH_*` secrets 才跑 `audit:real` 且 `continue-on-error`）、`package`（windows：`npm run app` → `audit:desktop` → NSIS → `audit:installer`，上传安装包产物）、`release`（`v*` 标签才跑：**先校验 `v<tag>` 与 `package.json` 的 `version` 一致**再用 `gh release` 建 Release 并 `--clobber` 上传，避免"标签是 v1.3.2、包里装的是 1.2.2"）。写工作流时注意 `concurrency.cancel-in-progress` 按 ref 分组：**同一分支连续推送会取消上一次运行**（`audit:desktop`/`audit:installer` 在内网真机上会跳过真机断言而不是失败，所以 CI 无 secrets 也能全绿）。工作流本身用 `npm run validate:workflow`（`scripts/validate-workflow.mjs`，40 断言，纯文本解析 YAML，不引入依赖）离线校验。
+**持续集成（2026-09-11，`.github/workflows/ci.yml`；首次全绿：run 34656642345）**：四个任务——`static`（ubuntu：`npm ci --ignore-scripts` + **工作流自校验** + typecheck/lint/build，**必须 `--ignore-scripts`**：node-pty 只发布 darwin/win32 预编译，Linux 上会退化成 node-gyp 全量编译，而这几步都不加载 node-pty；esbuild 平台包在 `optionalDependencies`，不受影响）、`test`（windows：`npm test` + `build` + `audit:ui`，配了 `SH_*` secrets 才跑 `audit:real` 且 `continue-on-error`）、`package`（windows：`npm run app` → `audit:desktop` → `npm run dist:nsis` → `audit:installer`，上传安装包产物）、`release`（`v*` 标签才跑，且 **`needs: [static, package]`**：静态检查挂了不许发版）：**先校验 `v<tag>` 与 `package.json` 的 `version` 一致**，再 `gh release create/upload --clobber`，**逐条检查 gh 退出码 + 上传后回头核对资产真的在线上 + 草稿则取消草稿**（否则最后那句必然成功的 `gh release view` 会把上传失败掩盖成绿色），避免"标签是 v1.3.2、包里装的是 1.2.2"。四个任务都设了 `timeout-minutes`（20/40/60/30）。写工作流时注意 `concurrency.cancel-in-progress` 按 ref 分组：**同一分支连续推送会取消上一次运行**（`audit:desktop`/`audit:installer` 在无 `SH_*` secrets 时会跳过真机断言而不是失败，所以 CI 无 secrets 也能全绿）。工作流本身用 `npm run validate:workflow`（`scripts/validate-workflow.mjs`，47 断言，纯文本解析 YAML，不引入依赖）离线校验，**static 任务里也会跑一次**。
 
 **CI 首次运行暴露的三个真问题（2026-09-11，已修）**：① `audit:ui` 加载的是**真实前端产物**（server 只在 `dist/` 存在时服务静态文件），而 `test` 任务没构建 → 首页 404、断言集体失败；同时 `ui-audit.cjs` 结尾写死 `app.exit(0)`，**断言失败也会以 0 退出**（本地串跑同样掩盖失败）——已补 `npm run build` 步骤、缺产物明确报错退出 2、退出码改为 `fail ? 1 : 0`。② `stress-process-reliability.mjs` / `stress-switch-stability.mjs` 里 `cls(HELPERS.down(i))` **把 Promise 当函数传**（`await fn()` 抛 `fn is not a function`）：请求变成"发射后不管"，既测不到结果，失败时又成为未处理的 rejection——本地请求都会正常返回所以看不出来，CI 上收尾杀子进程时的 ECONNRESET 才让它以 exit 1 崩掉（而 6 条断言全过）。已改为传 thunk、在 `cls()` 里显式拦截非函数入参、并给该脚本加 `unhandledRejection` 护栏。③ **CI 出包必须显式 `--publish never`**：electron-builder 检测到 CI 环境（`CI=true`）且能从 git remote 推断出 GitHub provider 时，会**隐式尝试把产物发布到 GitHub Release**，没有 `GH_TOKEN` 就直接以 exit 1 结束——而**安装包其实已经生成好了**（日志末尾只有一句 `⨯ GitHub Personal Access Token is not set`）。已抽成 `npm run dist:nsis`（= `electron-builder --win nsis --publish never`）、给 `npm run app` 也加上该参数，并在 `validate:workflow` 里加断言防回归（40 断言）。
 **看 CI 日志的坑**：PowerShell 直接读 `Invoke-WebRequest` 拿到的日志会把 UTF-8 显示成乱码（`é¶æ®µ2`），排查时用 node 的 `fetch` 拉 `/actions/jobs/<id>/logs` 再按 UTF-8 落盘；node-pty 的 `conpty_console_list_agent` 会打印 `Error: AttachConsole failed` 堆栈（本地与 CI 都有，属噪声，不影响断言）。
@@ -102,13 +102,13 @@ ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌�
 | `node scripts/verify-sessions.mjs` / `verify-20-sessions.mjs` | 离线断言：会话隔离 / 20 会话并发全开 |
 | `node scripts/stress-transfer-stability.mjs` / `stress-switch-stability.mjs` / `stress-process-reliability.mjs` | 离线压力：传输自愈 / 切换稳定 / 进程不崩 |
 | `npm run typecheck` | `tsc --noEmit`（只覆盖 `src/`，`server/`+`scripts/`+`electron/` 的未定义标识符由 lint 的 `no-undef` 兜底） |
-| `npm run lint` | `eslint src server scripts electron`（当前 0 error / 88 warning，warning 作改进清单） |
+| `npm run lint` | `eslint src server scripts electron --max-warnings 91`（当前 0 error / 91 warning；带上限是为了"警告只减不增"，加了新警告要顺手修掉或调这个数） |
 | `npm test` | 一键串跑：五个旧脚本 + `verify-fullhistory` + 可靠性矩阵 51 条 + 批次 J/K/L 新增的三个离线回归（verify-fixes 26 / verify-drag-paths 9 / verify-ansi-html 10） |
 | `npm run audit:real` | **真机回归**：`scripts/real-audit.mjs`，27 断言；凭据走 `SH_HOST/SH_USER/SH_PASS` 环境变量，未设置自动跳过 |
 | `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），16 断言：新建服务器/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载；**需先 `npm run build`**（加载的是真实前端产物，缺 `dist/` 会明确报错退出 2），断言失败退出码 1 |
 | `npm run audit:desktop` | **打包版 GUI 回归**：`scripts/desktop-audit.mjs`（对 `release/win-unpacked/ServerHub.exe` 用 CDP 驱动 + `Input.dispatchDragEvent` 合成真实拖放），15 断言：内置后端/数据目录、界面建服务器并连真机、**拖文件到远程列表=上传**、**拖到侧栏/终端区不导航走**、断开后会话仍在、单实例锁 |
 | `npm run audit:installer` | **安装包回归**：`scripts/installer-audit.mjs`（NSIS 静默安装 → 启动 → 种数据 → **覆盖安装** → 数据仍在 → 静默卸载 → 数据保留），18 断言；需先 `npm run dist:nsis` |
-| `npm run validate:workflow` | 离线校验 `.github/workflows/ci.yml`（40 断言：任务/触发/secrets 用法/步骤顺序/出包参数/版本一致性检查等），改工作流后跑一次 |
+| `npm run validate:workflow` | 离线校验 `.github/workflows/ci.yml`（47 断言：任务/触发/secrets 用法/步骤顺序/出包参数/发版细节/版本一致性检查等），改工作流后跑一次；**CI 的 static 任务也会跑它**（改坏工作流先在本地拦下） |
 
 ## 架构红线（改动前必读，均在 allfiles.md 有详细注释）
 
@@ -143,7 +143,7 @@ ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌�
 
 ### 阶段 0：源码恢复与环境搭建 ✅（2026-08-22 完成，含 5 处归档缺损修复，见上）
 
-### 阶段 1：基线验证 ✅（2026-08-22 完成：离线脚本全过 + 真机 18/18；桌面壳 `npm run app:dev` / `publish.bat` 出包尚未跑）
+### 阶段 1：基线验证 ✅（2026-08-22 完成：离线脚本全过 + 真机 18/18；桌面壳 `npm run app:dev` 与 `publish.bat` 出包当时未跑，**已由后面的批次 N 补齐**：打包版 GUI 审计 15 断言 + 安装包审计 18 断言 + CI 出包全绿）
 
 ### 阶段 2：文件管理能力补齐 ✅（2026-08-22 批次 E 完成：rename/mkdir/编辑保存/递归搜索，冒烟 24/24）
 
@@ -159,7 +159,7 @@ Web 端口无任何鉴权且 CORS 全开：增加**可选访问令牌**（env `S
 
 ### 阶段 5：体验增强 ✅（2026-08-22 批次 G 完成：健康摘要/上传并发/HTML 导出/小遗留;会话持久化维持"刻意不持久化"现状,断点续传列远期）
 
-连接健康仪表盘（复用 exec 跑 top/free 的preset）；传输队列并发度与断点续传；会话输出持久化与重启恢复（当前仅存名称，属刻意设计，改动需评估体积）；端口/主题设置界面；完整历史导出为 HTML（保留颜色）。
+连接健康仪表盘（复用 exec 跑 top/free 的preset）；传输队列并发度与断点续传；会话输出持久化与重启恢复（当前仅存名称，属刻意设计，改动需评估体积）；端口/主题设置界面（**实际未做**：只有 20 款特效皮肤的开关，没有应用主题/端口设置面板，"✅"仅指本阶段其余项已完成）；完整历史导出为 HTML（保留颜色）。
 
 ### 通用验收线（每个阶段）
 

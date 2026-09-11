@@ -8,7 +8,7 @@ ServerHub — a web UI for managing remote Linux servers over SSH. Features: SSH
 
 ## Commands
 
-Note: `npm test` runs the offline regression + stress suite (fake ssh2, no real server needed); `npm run typecheck` = `tsc --noEmit` (covers `src/` only — undefined identifiers in `server/`, `scripts/`, `electron/` are caught by eslint's `no-undef`); `npm run lint` = `eslint src server scripts electron`; `npm run audit:real` runs the **real-server** audit (`scripts/real-audit.mjs`, 27 assertions; credentials only via `SH_HOST`/`SH_USER`/`SH_PASS`, skipped when unset). The `@/*` alias is **not** configured in Vite and unused — use relative imports.
+Note: `npm test` runs the offline regression + stress suite (fake ssh2, no real server needed); `npm run typecheck` = `tsc --noEmit` (covers `src/` only — undefined identifiers in `server/`, `scripts/`, `electron/` are caught by eslint's `no-undef`); `npm run lint` = `eslint src server scripts electron --max-warnings 91` (the cap keeps the warning count from growing); `npm run audit:real` runs the **real-server** audit (`scripts/real-audit.mjs`, 27 assertions; credentials only via `SH_HOST`/`SH_USER`/`SH_PASS`, skipped when unset). The `@/*` alias is **not** configured in Vite and unused — use relative imports.
 
 | Command | Purpose |
 |---|---|
@@ -18,11 +18,13 @@ Note: `npm test` runs the offline regression + stress suite (fake ssh2, no real 
 | `npm start` | Production backend on port 3120. Serves `dist/` as static + SPA fallback **only if** `dist/` exists; does not rebuild it. |
 | `npm run preview` | `vite preview`. |
 | `npm run app:dev` | Electron dev: concurrently runs backend (nodemon) + Vite (HMR) + `electron .` with `ELECTRON_START_URL=http://localhost:5173`. |
-| `npm run app` / `npm run rebuild` | `npm run build` then `electron-builder --dir` → `release/win-unpacked/`. |
+| `npm run app` / `npm run rebuild` | `npm run build` then `electron-builder --dir --publish never` → `release/win-unpacked/`. `--publish never` is required: on a machine where `CI` is set, electron-builder infers a GitHub provider from the git remote and tries to publish implicitly (fails without `GH_TOKEN`, even though the artifacts were built fine). |
+| `npm run dist:nsis` | `npm run build` then `electron-builder --win nsis --publish never` → `release/ServerHub Setup <version>.exe` + `.blockmap` (what CI's package job and `npm run audit:installer` consume). |
+| `npm run audit:ui` / `audit:desktop` / `audit:installer` / `validate:workflow` | Extra suites: UI-level (hidden Electron window driving the real UI, fake ssh2, needs `dist/`), packaged-app (CDP against `release/win-unpacked/ServerHub.exe`, synthesizes OS drag & drop), NSIS installer (silent install → overwrite install keeps data → silent uninstall, needs `dist:nsis`), and the workflow self-check (parses `.github/workflows/ci.yml`, 47 assertions; also runs in CI's `static` job). |
 | `npm run icon` | Regenerate `build/icon.png` (Node-only `scripts/make-icon.mjs`). |
 | `npm run verify:session` | Offline `scripts/verify-sessions.mjs` — injects a fake ssh2 client, opens 2 WebSockets, asserts session 1 keeps running while session 2 is used. |
 | `node scripts/stress-transfer-stability.mjs` | Offline **stress test**: fake ssh2+sftp, opens a remote terminal WS + real local(node-pty) WS, then 40 rounds of upload/download/list with 3 injected "channel open failure" events on the file connection; asserts remote shell + both WS stay connected and transfers auto-recover (6/6). Run `node scripts/stress-transfer-stability.mjs`. |
-| `publish.bat` | Windows one-click desktop build: installs deps, makes icon, builds frontend, `electron-builder --dir`. |
+| `publish.bat` | Windows one-click desktop build: installs deps, makes icon, builds frontend, `electron-builder --dir --publish never` (same anti-implicit-publish reason as `npm run app`). |
 
 Verification without a test framework: `npx tsc --noEmit` (tsconfig has `noEmit: true`) and `npm run build`.
 
