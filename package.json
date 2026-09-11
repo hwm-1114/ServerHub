@@ -1,6 +1,6 @@
 {
   "name": "server-manager",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Linux 服务器管理 Web 工具",
   "type": "module",
   "main": "electron/main.cjs",
@@ -20,7 +20,7 @@
     "dist:nsis": "npm run build && electron-builder --win nsis --publish never",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src server scripts electron --max-warnings 91",
-    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs && node scripts/verify-fullhistory.mjs && node scripts/stress-reliability-matrix.mjs && node scripts/verify-fixes.mjs && node scripts/verify-drag-paths.mjs && node scripts/verify-ansi-html.mjs",
+    "test": "node scripts/verify-sessions.mjs && node scripts/verify-20-sessions.mjs && node scripts/stress-transfer-stability.mjs && node scripts/stress-switch-stability.mjs && node scripts/stress-process-reliability.mjs && node scripts/verify-fullhistory.mjs && node scripts/stress-reliability-matrix.mjs && node scripts/verify-fixes.mjs && node scripts/verify-drag-paths.mjs && node scripts/verify-ansi-html.mjs && node scripts/verify-security.mjs",
     "audit:real": "node scripts/real-audit.mjs",
     "audit:ui": "electron scripts/ui-audit.cjs",
     "audit:desktop": "node scripts/desktop-audit.mjs",
