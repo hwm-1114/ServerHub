@@ -1,5 +1,5 @@
 import { Server, ConnectionStatus, Session, LocalFavorite } from '../types'
-import { Plus, Settings, Trash2, Wifi, WifiOff, Server as ServerIcon, Terminal, Activity, ChevronRight, ChevronDown, TerminalSquare, MoreVertical, FolderKanban, X, Folder, Copy, Palette } from 'lucide-react'
+import { Plus, Settings, Trash2, Wifi, WifiOff, Server as ServerIcon, Terminal, Activity, ChevronRight, ChevronDown, TerminalSquare, MoreVertical, FolderKanban, X, Folder, Copy, Palette, Loader2 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { CommandPanel } from './CommandPanel'
 import { LocalDirBrowser } from './LocalDirBrowser'
@@ -232,11 +232,34 @@ export function Sidebar({
                         )}
                       </div>
 
+                      {/* 连接/断开:始终可见的一键开关。
+                          旧实现把它藏在需要 hover 才出现的设置菜单里,用户找不到"断开连接"按钮;
+                          另外 + 与齿轮也一直是 hover 才出现(鼠标没悬停就等于没有入口)。
+                          这里改为常显(低透明度,悬停变亮),连接状态一目了然。 */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (status === 'connected') onDisconnect(server.id)
+                          else if (status !== 'connecting') onConnect(server.id)
+                        }}
+                        disabled={status === 'connecting'}
+                        title={status === 'connected' ? `断开 ${server.name}` : status === 'connecting' ? '连接中…' : `连接 ${server.name}`}
+                        className={`p-1 rounded hover:bg-bg-600 transition-colors ${
+                          status === 'connected' ? 'text-accent-400 hover:text-red-400'
+                            : status === 'connecting' ? 'text-amber-400'
+                              : 'text-slate-500 hover:text-accent-400'
+                        }`}
+                      >
+                        {status === 'connected' ? <WifiOff size={14} />
+                          : status === 'connecting' ? <Loader2 size={14} className="animate-spin" />
+                            : <Wifi size={14} />}
+                      </button>
+
                       {/* 一键新建会话(无需点开设置菜单) */}
                       <button
                         onClick={(e) => { e.stopPropagation(); onCreateSession(server.id) }}
                         title={`新建 ${server.name} 的会话`}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-bg-600 text-slate-400 hover:text-accent-400"
+                        className="p-1 rounded hover:bg-bg-600 text-slate-400 opacity-60 hover:opacity-100 hover:text-accent-400 transition-all"
                       >
                         <Plus size={14} />
                       </button>
@@ -244,7 +267,7 @@ export function Sidebar({
                       {/* 菜单按钮 */}
                       <button
                         onClick={(e) => { e.stopPropagation(); setMenuOpenId(isMenuOpen ? null : `srv:${server.id}`) }}
-                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-bg-600"
+                        className="p-1 rounded hover:bg-bg-600 opacity-60 hover:opacity-100 transition-all"
                       >
                         <Settings size={14} className="text-slate-400" />
                       </button>

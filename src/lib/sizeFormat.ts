@@ -19,6 +19,25 @@ export function getSizeUnit(): SizeUnit {
 
 export function setSizeUnit(u: SizeUnit) {
   try { localStorage.setItem(STORAGE_KEY, u) } catch {}
+  // 广播给所有面板:单位偏好是全局的,但每个面板各自持有 useState,
+  // 没有通知时同屏会同时显示两种单位(设备面板 1.00 MB、侧栏 1048576 B)
+  try { window.dispatchEvent(new CustomEvent(UNIT_EVT, { detail: u })) } catch { /* 非浏览器环境忽略 */ }
+}
+
+const UNIT_EVT = 'serverhub:size-unit-change'
+
+/** 订阅单位变化(直接用作 useEffect 的清理函数);返回取消订阅函数 */
+export function onSizeUnitChange(fn: (u: SizeUnit) => void) {
+  try {
+    const handler = (e: Event) => {
+      const u = (e as CustomEvent).detail
+      if (SIZE_UNITS.includes(u)) fn(u)
+    }
+    window.addEventListener(UNIT_EVT, handler)
+    return () => window.removeEventListener(UNIT_EVT, handler)
+  } catch {
+    return () => {}
+  }
 }
 
 // 把字节数按单位格式化;目录返回 null(不显示大小)

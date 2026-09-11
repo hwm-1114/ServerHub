@@ -58,6 +58,8 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
   const fullContentRef = useRef('')
   // 原始字节块(完整历史重建视图回放用),含退出全屏前的抓屏快照
   const fullBytesRef = useRef<Uint8Array[]>([])
+  // 累积历史文本用的流式解码器(整条会话复用一个实例,详见下方 data 分支的说明)
+  const decoderRef = useRef<TextDecoder | null>(null)
 
   // 是否停留在终端视口底部(写入后保持回到底部,避免跳到会话最上方)。
   // 容差 1 行:末行无换行(提示符/光标行)时 xterm 报告的"底部"比实际少 1 行,
@@ -272,10 +274,17 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
           registerTerminalFocus(id, () => { termRef.current?.focus() })
           fullContentRef.current = ''
           fullBytesRef.current = []
+          decoderRef.current = null // 与累积缓冲同时重置:新连接的解码必须从零状态开始(不带上次的半个字符)
         } else if (msg.type === 'data') {
           // 还原成 UTF-8 字节再写入,避免多字节字符乱码
           const bytes = decodeBase64ToBytes(msg.data)
-          fullContentRef.current += new TextDecoder().decode(bytes)
+          // 累积历史文本必须用"整条会话唯一、流式"的 decoder:WS 分片边界可能正好落在
+          // 一个多字节字符中间,每帧新建一个非流式 TextDecoder 会把被切断的字符在前后
+          // 两帧各毁一次,累积文本里出现大量 U+FFFD(中文输出尤其明显),导出与
+          // 查看完整历史 就都是乱码。stream:true 会把半个字符留在解码器内部,与下一帧
+          // 拼合后再输出。字节留档与实时终端写入(xterm 直接吃字节)不受影响。
+          if (!decoderRef.current) decoderRef.current = new TextDecoder()
+          fullContentRef.current += decoderRef.current.decode(bytes, { stream: true })
           fullBytesRef.current.push(bytes) // 原始字节留档,供完整历史重建视图回放
           const atBottom = wasAtBottom()
           termRef.current?.write(bytes)
@@ -317,6 +326,12 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
         const shellExited = ev.code === 1000 && ev.reason === 'shell-exit'
         if (shellExited) {
           termRef.current?.writeln(`\r\n\x1b[90m(shell 已退出,如需继续可关闭本标签后重新打开)\x1b[0m`)
+        } else if (ev.code === 1008) {
+          // 1008 = 策略违规。与 /ws/terminal 共用同一个鉴权入口(/ws/local 也可能是
+          // "未授权:缺少或错误的访问令牌"),重试必然再次被拒:原样显示服务端原因,
+          // 且不做自动重连(否则只是空转 3 次后报"重连失败")
+          termRef.current?.writeln(`\r\n\x1b[31m✗ ${ev.reason || '连接被服务端拒绝'}\x1b[0m`)
+          termRef.current?.writeln(`\r\n\x1b[31m✗ 未自动重连,请按上述提示处理后再重新打开\x1b[0m`)
         } else if (retryRef.current < 3) {
           termRef.current?.writeln(`\r\n\x1b[33m⚠ 连接已断开,正在重连...\x1b[0m`)
           const delay = 1000 * (retryRef.current + 1)

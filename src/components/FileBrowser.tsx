@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { FileEntry, Bookmark } from '../types'
 import { startUpload, startDownload, whenSettled } from '../lib/TransferStore'
-import { collectDroppedFiles } from '../lib/dragFiles'
+import { collectDroppedFiles, targetDirForRelPath } from '../lib/dragFiles'
 import { ConfirmDialog } from './ConfirmDialog'
 import { RemoteLocalPanel } from './RemoteLocalPanel'
 import { apiFetch } from '../lib/api'
 import { withWsToken } from '../lib/token'
+import { onRemoteRefresh } from '../lib/uiBus'
 import { DND_MIME, makeDndData, readDndData, DndFile } from './DeviceFilePanel'
 import {
   Folder, File, ChevronRight, Home, ArrowUp, RefreshCw, Plug,
@@ -73,6 +74,11 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   const selAnchorRef = useRef(-1)
   // 目录加载请求序号:仅最新一次 loadDir 的响应允许写入 state(防快速导航竞态)
   const loadSeqRef = useRef(0)
+  // 预览请求序号:同上,防止慢的预览响应覆盖后点的文件
+  const viewSeqRef = useRef(0)
+  // 疑似二进制:含 NUL 或解码出替换字符(U+FFFD)。这类文件在线编辑=按文本重编码,
+  // 保存会损坏原文件,因此编辑入口要显式警告并二次确认。
+  const isLikelyBinary = !!fileContent && (fileContent.content.includes('\u0000') || (fileContent.content.match(/\uFFFD/g) || []).length > 0)
 
   // 批量下载选中远程文件到本机当前目录(串行,聚合每文件失败原因)
   const downloadSelectedLocal = async () => {
@@ -143,6 +149,13 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
     // 请求序号防竞态:快速连续导航时,旧请求的响应若晚于新请求返回,直接丢弃,
     // 避免过期数据覆盖 entries / 把 currentPath 定回旧目录
     const seq = ++loadSeqRef.current
+    // 目录一变,之前勾选的远端路径就失效(可能属于别的目录、别的服务器,或已被删除):
+    // 清空选择,否则工具栏仍显示"下载选中到本机 (N)",点下去下载的是上一个目录里的文件。
+    // 预览面板同理清空:删除/重命名后旧预览若还能保存,会把已删除的文件按旧内容写回来。
+    setSelRemote(new Set())
+    selAnchorRef.current = -1
+    setFileContent(null)
+    setEditing(false)
     setLoading(true)
     setError('')
     setRawOutput(null)
@@ -284,18 +297,22 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   }
 
   const viewFile = async (filePath: string) => {
+    // 请求序号:慢的预览响应不能覆盖后点的文件(loadDir 有同类守卫,预览此前漏了)
+    const seq = ++viewSeqRef.current
     setLoading(true)
     try {
       const res = await fetch(`/api/servers/${serverId}/files/content?path=${encodeURIComponent(filePath)}`)
       const data = await res.json()
+      if (seq !== viewSeqRef.current) return
       if (!res.ok) throw new Error(data.error)
       setFileContent({ path: filePath, content: data.content })
       setEditDraft(data.content)
       setEditing(false)
     } catch (err) {
+      if (seq !== viewSeqRef.current) return
       setError(err instanceof Error ? err.message : '读取失败')
     } finally {
-      setLoading(false)
+      if (seq === viewSeqRef.current) setLoading(false)
     }
   }
 
@@ -311,6 +328,10 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   useEffect(() => {
     fetchBookmarks()
   }, [fetchBookmarks, isConnected])
+
+  // 本机面板批量上传到远程后,由 uiBus 通知这里刷新列表(否则远程列表停留在旧内容,
+  // 用户以为没上传成功甚至重复上传)。必须放在 loadDir/fetchBookmarks 定义之后。
+  useEffect(() => onRemoteRefresh(() => { loadDir(currentPathRef.current); fetchBookmarks() }), [loadDir, fetchBookmarks])
 
   const addBookmark = async () => {
     if (!currentPath || currentPath === '~') return
@@ -475,18 +496,42 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
     dragDepthRef.current = 0
     setDragOverDepth(0)
     if (!e.dataTransfer || !isConnected) return
+    // 目录还在解析(~ 未换成绝对路径)时上传必被后端拒绝,给一句能看懂的提示
+    if (currentPath === '~') { setNotice('目录仍在解析,请稍候再拖拽上传'); return }
     const dropped = await collectDroppedFiles(e.dataTransfer)
     if (dropped.length === 0) return
-    const ids: string[] = []
+    const base = currentPath
+    // 拖入文件夹时 relPath 带层级(如 src/sub/a.txt),远端需要先把父目录建出来:
+    // 上传链路只写文件、不建目录,旧实现下子目录里的文件全部以 "No such file" 失败。
+    const needDirs = new Set<string>()
+    const planned: { targetDir: string; d: typeof dropped[number] }[] = []
     for (const d of dropped) {
-      // 目标目录 = 当前目录(或加相对子路径)
-      const base = currentPath === '~' ? '~' : currentPath
-      const targetDir = d.relPath.includes('/')
-        ? `${base.replace(/\/+$/, '')}/${d.relPath.substring(0, d.relPath.lastIndexOf('/'))}`
-        : base
+      const targetDir = targetDirForRelPath(base, d.relPath)
+      planned.push({ targetDir, d })
+      if (targetDir !== base) needDirs.add(targetDir)
+    }
+    let mkdirFailed = ''
+    for (const dir of needDirs) {
+      try {
+        await apiFetch(`/api/servers/${serverId}/files/mkdir`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // existOk:目录已存在也算成功(mkdir -p 语义);不存在则递归创建
+          body: JSON.stringify({ path: dir, existOk: true }),
+        })
+      } catch (err) {
+        mkdirFailed = err instanceof Error ? err.message : '未知错误'
+        break
+      }
+    }
+    if (mkdirFailed) { setNotice(`创建目标目录失败:${mkdirFailed}`); return }
+    const ids: string[] = []
+    for (const { targetDir, d } of planned) {
       ids.push(startUpload(serverId, targetDir, d.file))
     }
-    setNotice(`已添加 ${dropped.length} 个文件到上传队列`)
+    setNotice(needDirs.size
+      ? `已添加 ${dropped.length} 个文件到上传队列(自动创建 ${needDirs.size} 个目录)`
+      : `已添加 ${dropped.length} 个文件到上传队列`)
     // 全部传完后刷新(用目录 ref,避免闭包捕获拖放瞬间的旧目录)
     whenSettled(ids, () => { loadDir(currentPathRef.current); fetchBookmarks() })
   }
@@ -904,6 +949,15 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
                   key={p}
                   onClick={() => {
                     const dir = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) || '/' : currentPath
+                    // 命中项就在当前目录时 navigateTo 会因为 newPath === currentPath 提前返回,
+                    // 搜索视图只会在 loadDir 里被清掉 → 表现为"搜索结果点了没反应"。
+                    // 这里显式处理:同一目录就直接退出搜索视图,文件则顺手打开预览。
+                    if (dir === currentPath) {
+                      setSearchResults(null)
+                      setSearchQ('')
+                      if (!p.endsWith('/')) viewFile(p)
+                      return
+                    }
                     navigateTo(dir)
                   }}
                   className="flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-slate-300 hover:bg-bg-700 cursor-pointer"
@@ -1048,9 +1102,15 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
               ) : (
                 <>
                   <button
-                    onClick={() => setEditing(true)}
-                    className="p-1.5 rounded hover:bg-bg-600 text-slate-400 hover:text-accent-400"
-                    title="在线编辑此文件"
+                    onClick={() => {
+                      // 疑似二进制文件(NUL 或 UTF-8 替换字符):在线编辑是"按文本读→按文本写",
+                      // 保存会不可逆地损坏原文件,必须先明确确认
+                      if (isLikelyBinary && !confirm('该文件疑似二进制(内容含不可解码字节)。\n在线编辑会按文本重新编码,保存后原文件将被损坏且不可恢复。\n仍要继续编辑吗?')) return
+                      setEditing(true)
+                    }}
+                    disabled={false}
+                    className={`p-1.5 rounded hover:bg-bg-600 ${isLikelyBinary ? 'text-amber-400' : 'text-slate-400 hover:text-accent-400'}`}
+                    title={isLikelyBinary ? '疑似二进制文件,在线编辑会损坏内容' : '在线编辑此文件'}
                   >
                     <Pencil size={14} />
                   </button>
@@ -1069,6 +1129,11 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
             </div>
           </div>
           <div className="flex-1 overflow-auto p-3">
+            {isLikelyBinary && !editing && (
+              <div className="mb-2 px-2 py-1.5 rounded bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300">
+                疑似二进制文件(内容含不可解码字节)。预览不可读属正常,在线编辑并保存会损坏原文件。
+              </div>
+            )}
             {editing ? (
               <textarea
                 value={editDraft}

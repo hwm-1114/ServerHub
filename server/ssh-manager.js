@@ -425,16 +425,39 @@ async function doCreateShell(serverId, sessionId, initialDir) {
 // ========== 复制会话:保持相同路径 ==========
 // 交互式 shell 的当前目录无法从逐字符的输入里可靠解析,也无法用 exec('pwd') 得到
 // (exec 新通道都是从登录目录起)。所以这里直接往目标会话的 shell 注入 pwd,读取返回的
-// 第一行作为该会话当前路径。被测量会话的 WS 转发会被 isMeasuringCwd 暂时屏蔽,避免
-// 用户终端上闪现 pwd 及其输出。
+// 一行作为该会话当前路径。被测量会话的 WS 转发会被 isMeasuringCwd 暂时屏蔽,避免
+// 用户终端上闪现注入的命令及其输出。
+//
+// 关键设计(真机踩坑后定稿):解析用的首尾标记**必须由远端 printf 拼出来**,
+// 即注入文本写成 `printf 'SCWD%s\n' '_B_<nonce>'`,这样:
+//   - 终端回显的是 `printf 'SCWD%s\n' '_B_<nonce>'`(含 %s 与 nonce,但【不含】解析串);
+//   - 只有命令的**输出**里才会出现真正用于解析的 `SCWD_B_<nonce>`。
+// 旧实现把标记直接写在注入文本里,于是回显里先出现一次"结束标记",pickPath 在回显处
+// 截断、看不到 pwd 的输出 → 真机上 cwd 恒为空(复制路径/复制会话保持目录全部失效);
+// 而且旧文本里引号内带了裸 \r,会把命令行提前提交,留一个多余的 `> ` 续行提示符,
+// 并把用户正在输入的内容一起卷进这条畸形命令里执行。现在:
+//   - 去掉引号内的裸 \r,改用 printf 的 \n;
+//   - 注入前先发 Ctrl-U(\x15)清空当前输入行,用户打了一半的命令被丢弃而不会被
+//     "拼进"注入命令里误执行(旧行为会把两者拼接后执行,可能是破坏性的);
+//   - 同一会话的测量串行化,避免并发注入互相踩缓冲区。
 const measuringCwd = new Set()
 
 export function isMeasuringCwd(sessionId) {
   return !!sessionId && measuringCwd.has(sessionId)
 }
 
+// 同一会话的 cwd 测量串行排队:并发注入会让两次测量共用一段终端回显,解析必然出错
+const cwdChains = new Map() // sessionId -> Promise
+
 // 返回某会话 shell 的当前绝对路径;拿不到(未连/未开 shell/失败)则 reject
 export function captureShellCwd(serverId, sessionId) {
+  const prev = cwdChains.get(sessionId) || Promise.resolve()
+  const run = prev.catch(() => {}).then(() => doCaptureShellCwd(serverId, sessionId))
+  cwdChains.set(sessionId, run.then(() => {}, () => {}))
+  return run
+}
+
+function doCaptureShellCwd(serverId, sessionId) {
   const arr = terminalConns.get(serverId) || []
   if (!arr.length) {
     return Promise.reject(new Error('服务器未连接'))
@@ -447,11 +470,11 @@ export function captureShellCwd(serverId, sessionId) {
   if (!shell) return Promise.reject(new Error('该会话未打开'))
 
   return new Promise((resolve, reject) => {
-    // 用首尾唯一标记包裹 pwd;一旦收到"结束标记"(说明 pwd 及其后的提示符都已回显),
-    // 立刻解析路径并结束测量 —— 屏蔽窗口从"最长 200ms+10s 兜底"压到"约一个往返",
-    // 大幅减少对用户实时终端输出/回显的吞没。兜底仍保留为短超时(如吞掉也尽快恢复)。
-    const tag = 'SCWD_' + sessionId + '_' + Date.now()
-    const endTag = 'SCWD_END_' + tag
+    // 用首尾唯一标记包裹 pwd;一旦收到"结束标记"(说明 pwd 输出已到)立刻解析并结束测量,
+    // 屏蔽窗口只有约一个往返。兜底保留为短超时(拿不到标记也要尽快恢复转发)。
+    const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    const beginTag = `SCWD_B_${nonce}`
+    const endTag = `SCWD_E_${nonce}`
     measuringCwd.add(sessionId)
     let buf = ''
     let done = false
@@ -466,11 +489,13 @@ export function captureShellCwd(serverId, sessionId) {
       return t.trim()
     }
     const pickPath = () => {
-      // 从结束标记处截取,保证只解析 pwd 那段输出,不受用户此后新输入影响
-      const idx = buf.indexOf(endTag)
-      const seg = idx >= 0 ? buf.slice(0, idx) : buf
+      // 只解析"起始标记之后、结束标记之前"这一段;pwd 的输出就在其中
+      const i = buf.indexOf(beginTag)
+      if (i < 0) return null
+      const j = buf.indexOf(endTag)
+      const seg = buf.slice(i + beginTag.length, j >= 0 && j > i ? j : buf.length)
       const clean = stripAnsiTxt(seg)
-      const line = clean.split(/\r?\n/).find(x => x.trim() && x.trim().startsWith('/'))
+      const line = clean.split(/\r?\n/).map(x => x.trim()).find(x => x.startsWith('/'))
       return line === undefined ? null : cleanLine(line)
     }
 
@@ -484,7 +509,7 @@ export function captureShellCwd(serverId, sessionId) {
     }
     const onData = (data) => {
       buf += data.toString()
-      // 收到结束标记 → pwd 输出与随后提示符已回显,立即解析并结束
+      // 收到结束标记 → pwd 的输出已到齐,立即解析并结束
       if (buf.includes(endTag)) {
         const got = pickPath()
         cleanup()
@@ -494,8 +519,12 @@ export function captureShellCwd(serverId, sessionId) {
     const onClose = () => { cleanup(); reject(new Error('会话已关闭')) }
     shell.on('data', onData)
     shell.on('close', onClose)
-    // printf 先打开始标记,然后 pwd,再打结束标记(\r 促成回显缓冲 flush)
-    try { shell.write(`printf '${tag}'; pwd; printf '${endTag}\r'` + '\r') } catch (err) { cleanup(); reject(err); return }
+    // 一次写出:先 Ctrl-U 清掉当前输入行(用户打了一半的命令不会被拼进来误执行),
+    // 再注入远端拼标记的 pwd 命令。标记只用 %s 拼出,所以回显里不含解析串。
+    const inject = '\x15'
+      + `printf 'SCWD%s\\n' '_B_${nonce}'; pwd; printf 'SCWD%s\\n' '_E_${nonce}'`
+      + '\r'
+    try { shell.write(inject) } catch (err) { cleanup(); reject(err); return }
     // 兜底:慢速/高负载远端也可能拿不到标记,短超时后尽力取路径并结束测量,
     // 避免一直屏蔽转发(不再需要 10s,3s 内正常情况下早已通过标记返回)。
     timer = setTimeout(() => {
@@ -701,7 +730,8 @@ export async function createUploadStream(serverId, remotePath) {
   })
 }
 
-// 递归删除(不跟随符号链接:符号链接只删链接本身),失败链式抛出
+// 递归删除(不跟随符号链接:符号链接只删链接本身),失败链式抛出。
+// 注意:判类型必须用 lstat(见 removeRecursive),否则符号链接会被当成它指向的目录。
 export async function deletePath(serverId, remotePath, { recursive = true } = {}) {
   const sftp = await getFileSftp(serverId)
 
@@ -722,24 +752,38 @@ export async function renamePath(serverId, fromPath, toPath) {
   })
 }
 
-// 新建目录(递归:逐级 mkdir,已存在的层级跳过;整个路径已存在则报错)
-export async function makeDirectory(serverId, dirPath) {
+// 新建目录(递归:逐级 mkdir,已存在的层级跳过)
+// - existOk=false(默认,建目录对话框):整个路径已存在则报错,避免"看起来建好了"的静默语义
+// - existOk=true:已存在且是目录时视为成功(mkdir -p 语义),供"拖入文件夹上传前补建父目录"使用
+// - 路径中某一级已存在且不是目录(是文件或链接):给出明确中文报错,而不是把
+//   sshd 的 "No such file"/"Failure" 原样抛给用户
+export async function makeDirectory(serverId, dirPath, { existOk = false } = {}) {
   const sftp = await getFileSftp(serverId)
   const target = String(dirPath).replace(/\/+$/, '')
-  // 已存在(文件或目录)直接报错,避免静默覆盖语义
-  const exists = await new Promise((resolve) => {
-    sftp.stat(target, (err, st) => resolve(!err && !!st))
+  const st = await new Promise((resolve) => {
+    sftp.lstat(target, (err, s) => resolve(err ? null : s))
   })
-  if (exists) throw new Error('已存在同名文件或目录')
+  if (st) {
+    if (existOk && isDirStat(st)) return true
+    if (existOk && isLinkStat(st)) {
+      // 链接指向目录时也算"已存在",交给后续写入自己去解析
+      return true
+    }
+    throw new Error('已存在同名文件或目录')
+  }
   const parts = target.split('/').filter(Boolean)
   let cur = ''
   for (const part of parts) {
     cur += '/' + part
     await new Promise((resolve, reject) => {
-      sftp.mkdir(cur, (err) => {
-        // SSH_FX_FAILURE(4)常见于"目录已存在",逐级创建时忽略;其余(权限等)报错
-        if (err && err.code !== 4) return reject(err)
-        resolve()
+      sftp.mkdir(cur, async (err) => {
+        if (!err) { resolve(); return }
+        // 逐级创建时"已存在"属正常(并发或上一级刚建),SSH_FX_FAILURE(4) 也常见于此;
+        // 用 lstat 复核:确实是目录就放行,否则给出能看懂的原因
+        const cur2 = await new Promise((res) => { sftp.lstat(cur, (e, s) => res(e ? null : s)) })
+        if (isDirStat(cur2)) { resolve(); return }
+        if (cur2) { reject(new Error(`无法创建目录:「${cur}」已存在且不是目录`)); return }
+        reject(new Error(`无法创建目录「${cur}」:${err.message}`))
       })
     })
   }
@@ -759,12 +803,25 @@ export async function writeFileContent(serverId, filePath, content) {
   })
 }
 
+// SFTP 属性对象断言的安全包装:ssh2 一定提供这些方法,但部分 SFTP 实现/测试替身可能
+// 只给 isDirectory/isFile。直接调用缺失的方法会抛 TypeError —— 而这个抛点常在回调里,
+// Promise 永不 settle,路由会变成挂死的僵尸请求(离线矩阵实测到)。
+const isLinkStat = (st) => typeof st?.isSymbolicLink === 'function' && st.isSymbolicLink()
+const isDirStat = (st) => typeof st?.isDirectory === 'function' && st.isDirectory()
+
 function removeRecursive(sftp, target, recursive) {
   return new Promise((resolve, reject) => {
-    sftp.stat(target, (statErr, stat) => {
+    // 必须用 lstat(不跟随符号链接)判类型,这是删除安全的关键:
+    // 旧实现用 stat,会把"指向目录的符号链接"识别成真目录,于是
+    //   readdir(链接) 拿到的是【目标目录】的内容 → 逐个子项按 `链接/子项` 递归删除,
+    //   删掉的其实是目标目录里的真实文件 → 最后 rmdir(链接) 必然失败(不是目录)。
+    // 结果:接口报错、链接还在,链接指向的目录内容却被清空(真机实测到数据丢失)。
+    // 指向文件的链接同样会被"只删链接"的偶然行为掩盖,悬空链接则因 stat ENOENT 永远删不掉。
+    // lstat 下链接就是链接对象:直接 unlink,既不递归也不会碰到目标,悬空链接也能正常删。
+    sftp.lstat(target, (statErr, stat) => {
       if (statErr) { reject(statErr); return }
-      if (!stat.isDirectory()) {
-        // 文件或符号链接:直接 unlink(链接本身)
+      if (isLinkStat(stat) || !isDirStat(stat)) {
+        // 文件或符号链接(含悬空链接):直接 unlink 链接/文件本身
         sftp.unlink(target, (uErr) => uErr ? reject(uErr) : resolve(true))
         return
       }

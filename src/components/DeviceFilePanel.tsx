@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Folder, File as FileIcon, ArrowUp, Smartphone, ChevronRight, Loader2, RefreshCw, Copy, Upload, Download, Check, PlugZap, Unplug, CheckSquare, Square } from 'lucide-react'
-import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit } from '../lib/sizeFormat'
+import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit, onSizeUnitChange } from '../lib/sizeFormat'
+import { requestLocalRefresh, onDeviceRefresh } from '../lib/uiBus'
 
 interface Props {
   /** 面板宽度(由父组件通过拖拽分隔线控制) */
@@ -60,6 +61,8 @@ export function DeviceFilePanel({ width }: Props) {
   }, [])
   // 文件大小显示单位(默认字节)
   const [unit, setUnitState] = useState<SizeUnit>(() => getSizeUnit())
+  // 其它面板改了大小单位时同步(单位是全局偏好,同屏两处显示不能不一致)
+  useEffect(() => onSizeUnitChange(setUnitState), [])
   const dropDirRef = useRef<string | null>(null)
   // 批量选择设备文件 → 下载到本机;Shift 连续选择
   const [selectMode, setSelectMode] = useState(false)
@@ -99,25 +102,36 @@ export function DeviceFilePanel({ width }: Props) {
     })()
   }, [loadTargets])
 
+  const loadSeqRef = useRef(0)
   const load = useCallback(async (p: string) => {
+    // 请求序号:快速点目录/切设备时,慢的旧响应不能覆盖新目录的内容
+    const seq = ++loadSeqRef.current
     setLoading(true); setError('')
     try {
       const q = serial ? `&serial=${encodeURIComponent(serial)}` : ''
       const r = await fetch(`/api/local/hdc-list?path=${encodeURIComponent(p)}${q}`)
       const d = await r.json()
+      if (seq !== loadSeqRef.current) return
       // 失败时清空列表:残留旧 entries 会与错误提示并存,误导用户以为还是设备当前内容
       if (d.error) { setError(d.error); setEntries([]); return }
       setEntries(d.entries || [])
     } catch {
+      if (seq !== loadSeqRef.current) return
       setError('无法获取设备目录')
       setEntries([])
     } finally {
-      setLoading(false)
+      if (seq === loadSeqRef.current) setLoading(false)
     }
   }, [serial])
 
   // 有设备且已连接时读取目录;serial/devicePath/refreshTick 变化都会刷新(不做周期轮询)
   useEffect(() => { if (connected && serial) load(devicePath) }, [devicePath, serial, connected, refreshTick, load])
+  // 设备目录一变就清空勾选:勾选的是绝对设备路径,换目录后按钮还显示"(N)"
+  // 会把上一个目录(可能是别的设备)的文件拿去下载
+  useEffect(() => { setSelected(new Set()); selAnchorRef.current = -1 }, [devicePath, serial])
+
+  // 侧栏批量上传到设备后由 uiBus 通知刷新(否则设备列表停留在旧内容)
+  useEffect(() => onDeviceRefresh(() => { if (connected && serial) load(devicePath) }), [connected, serial, devicePath, load])
 
   // 连接/断开:直接把当前设备设为连接打开/关闭目录浏览
   const toggleHdc = async () => {
@@ -215,15 +229,22 @@ export function DeviceFilePanel({ width }: Props) {
     if (files.length === 0 || !dir) { showToast('请选择文件,并填写本机保存目录', 'warn'); return }
     setBatchBusy(true)
     let ok = 0
+    const fails: string[] = []
     for (const devPath of files) {
+      const name = devPath.split('/').filter(Boolean).pop() || devPath
       try {
         const r = await fetch('/api/local/hdc-recv', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ devicePath: devPath, localDir: dir }),
+          // serial 必须带上:多设备时后端只认 body 里的 serial,不带就会落到 hdc 默认设备
+          body: JSON.stringify({ devicePath: devPath, localDir: dir, serial }),
         })
-        const d = await r.json()
-        if (r.ok && !d.error) ok++
-      } catch {}
+        const d = await r.json().catch(() => ({}))
+        if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`)
+        ok++
+      } catch (err) {
+        // 旧实现只数成功数:3 个全失败也会弹绿色"已下载 0/3",用户以为成功
+        fails.push(`${name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
     }
     setBatchBusy(false)
     setSelected(new Set())
@@ -231,7 +252,14 @@ export function DeviceFilePanel({ width }: Props) {
     try {
       await fetch('/api/local/transfer-state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ localDir: dir }) })
     } catch {}
-    showToast(`已下载 ${ok}/${files.length} 个文件到本机`)
+    if (fails.length === 0) {
+      showToast(`已下载 ${ok}/${files.length} 个文件到本机 ${dir}`)
+    } else {
+      const head = fails.slice(0, 2).join('；')
+      showToast(`已下载 ${ok}/${files.length} 个文件,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`, 'warn')
+    }
+    // 通知侧栏本机目录列表刷新(否则下载完在侧栏看不到新文件,用户以为失败并重复下载)
+    requestLocalRefresh()
     load(devicePath)
   }
 

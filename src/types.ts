@@ -5,6 +5,8 @@ export interface Server {
   port: number
   username: string
   password: string
+  /** 私钥(PEM 全文,可选)。填了私钥时后端只用私钥认证、忽略密码 */
+  privateKey?: string
   createdAt?: string
 }
 

@@ -155,7 +155,9 @@ export function startUpload(serverId: string, dir: string, file: File): string {
   } })
 
   xhr.upload.onprogress = (e) => {
-    if (e.lengthComputable) {
+    // 0 字节文件的进度事件 total=0(0/0 → NaN),会让进度条显示 "NaN%";
+    // 这里只在 total 有效时按比例计算,否则保持 0
+    if (e.lengthComputable && e.total > 0) {
       update(id, { progress: Math.round((e.loaded / e.total) * 100) })
     }
   }
@@ -221,7 +223,10 @@ async function saveViaPicker(res: Response, fileName: string, total: number | nu
 }
 
 export async function startDownload(serverId: string, path: string): Promise<string> {
-  const fileName = decodeURIComponent(path).split('/').filter(Boolean).pop() || 'file'
+  // 这里拿到的是【原始远端路径】(调用方直接传 entry.filename 拼出来的路径,不是 URL 编码串)。
+  // 绝不能再 decodeURIComponent:文件名里含 % 时它要么抛 URIError(整个下载毫无反应、无提示),
+  // 要么把 a%20b 这种合法文件名解成 a b(存成错误的文件名)。
+  const fileName = String(path).split('/').filter(Boolean).pop() || 'file'
   const id = makeId('dl')
   ensureTransfer({ id, serverId, fileName, type: 'download' })
 
@@ -238,10 +243,11 @@ export async function startDownload(serverId: string, path: string): Promise<str
       return id
     }
     const total = Number(res.headers.get('Content-Length') || 0) || null
-    const reader = res.body?.getReader()
-    if (!reader) throw new Error('无法读取响应流')
 
-    // 大文件优先流式另存(取消键由 AbortController 中断 read,-picker 流会 abort)
+    // 大文件优先流式另存(取消键由 AbortController 中断 read,-picker 流会 abort)。
+    // 注意:这一步必须在【取出 reader 之前】分流 —— ReadableStream 一旦 getReader()
+    // 就被锁定,再 getReader() 会抛 "Invalid state: ReadableStream is locked",
+    // 导致 >64MB 的下载在用户选完另存为路径后必然失败(且不会回退 Blob 方案)。
     if (total === null || total > STREAM_SAVE_THRESHOLD) {
       try {
         await saveViaPicker(res, fileName, total, (p) => update(id, { progress: p }))
@@ -249,14 +255,22 @@ export async function startDownload(serverId: string, path: string): Promise<str
         update(id, { status: 'done', progress: 100 })
         return id
       } catch (err) {
-        // 用户取消选择对话框 / API 不可用:取消传输或回退 Blob 方案
+        // 用户取消另存为对话框:按"已取消"处理,不是失败
+        if (err instanceof Error && (err.name === 'AbortError' || /abort/i.test(err.message))) {
+          controllers.delete(id)
+          update(id, { status: 'cancelled' })
+          return id
+        }
         if (err instanceof Error && err.message === 'UNSUPPORTED') {
-          // 落到下方 Blob 路径(响应流未消费,reader 仍可读)
+          // 浏览器不支持 File System Access API:落到下方 Blob 路径(响应流未被消费)
         } else {
           throw err
         }
       }
     }
+
+    const reader = res.body?.getReader()
+    if (!reader) throw new Error('无法读取响应流')
 
     const chunks: BlobPart[] = []
     let received = 0

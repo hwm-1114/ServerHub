@@ -1,6 +1,12 @@
 @echo off
+rem 本文件按 UTF-8(无 BOM)保存且含中文提示,先切到 UTF-8 代码页避免控制台乱码
+chcp 65001 >nul
 title ServerHub - Build Windows App
-cd /d %~dp0
+
+rem 切到脚本所在目录:必须加引号(路径可能含 ^& 等 cmd 元字符),并检查是否真的切换成功,
+rem 否则切换失败时脚本会在"错误的工作目录"里继续打包,却照样打印成功信息
+cd /d "%~dp0"
+if errorlevel 1 goto :cd_failed
 
 echo ============================================
 echo   ServerHub - 一键生成 Windows 应用
@@ -64,3 +70,10 @@ echo   提示: 开发时用  npm run app:dev  -- 改代码应用即时刷新(HMR
 echo   每次改了代码想更新这份应用,重跑本脚本即可。
 echo.
 pause
+exit /b 0
+
+:cd_failed
+echo [错误] 无法切换到脚本所在目录: "%~dp0"
+echo        该路径不存在,或包含 cmd 特殊字符(如 ^&)。请在本地磁盘上重新运行本脚本。
+pause
+exit /b 1

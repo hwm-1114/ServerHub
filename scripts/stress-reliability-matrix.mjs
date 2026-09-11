@@ -88,7 +88,10 @@ class FakeReadStream extends EventEmitter {
 }
 class FakeSftp extends EventEmitter {
   readdir(dir, cb) { const e = maybeExhaust(); if (e) return cb(e); setImmediate(() => cb(null, [...fakeFS.entries()].filter(([p, n]) => n && !n.isDir && p.startsWith(dir + '/')).map(([p, n]) => ({ filename: p.split('/').pop(), attrs: { size: n.size ?? 0, mode: 0o100644, mtime: 1700000000, isDirectory: () => false, isFile: () => true, isSymbolicLink: () => false } })))) }
-  stat(p, cb) { const e = maybeExhaust(); if (e) return cb(e); setImmediate(() => { const n = fakeFS.get(p); if (!n) return cb(Object.assign(new Error('No such file'), { code: 2 })); cb(null, { size: n.size ?? 0, isFile: () => !n.isDir, isDirectory: () => !!n.isDir }) }) }
+  stat(p, cb) { const e = maybeExhaust(); if (e) return cb(e); setImmediate(() => { const n = fakeFS.get(p); if (!n) return cb(Object.assign(new Error('No such file'), { code: 2 })); cb(null, { size: n.size ?? 0, isFile: () => !n.isDir, isDirectory: () => !!n.isDir, isSymbolicLink: () => false }) }) }
+  // 删除链路改用 lstat 判类型(不跟随符号链接,见 ssh-manager.removeRecursive)。
+  // 这个假文件系统里没有符号链接,故 lstat 与 stat 等价。
+  lstat(p, cb) { return this.stat(p, cb) }
   mkdir(p, cb) { fakeFS.set(p, { isDir: true }); setImmediate(() => cb(null)) }
   rmdir(p, cb) { fakeFS.delete(p); setImmediate(() => cb(null)) }
   unlink(p, cb) { fakeFS.delete(p); setImmediate(() => cb(null)) }

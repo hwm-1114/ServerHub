@@ -39,7 +39,9 @@ class FakeSftp extends EventEmitter {
     return false
   }
   readdir(dir, cb) { if (this._maybeFail(cb)) return; cb(null, []) }
-  stat(p, cb) { if (this._maybeFail(cb)) return; cb(null, { isDirectory: () => false, size: (this.map.get(p)?.length || 0), isFile: () => true }) }
+  stat(p, cb) { if (this._maybeFail(cb)) return; cb(null, { isDirectory: () => false, size: (this.map.get(p)?.length || 0), isFile: () => true, isSymbolicLink: () => false }) }
+  // 删除链路用 lstat 判类型(不跟随符号链接);本假文件系统无符号链接,故等价于 stat
+  lstat(p, cb) { return this.stat(p, cb) }
   unlink(p, cb) { this.map.delete(p); cb(null) }
   rmdir(p, cb) { cb(null) }
   createReadStream(p) {

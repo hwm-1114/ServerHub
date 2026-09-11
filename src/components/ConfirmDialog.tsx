@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { AlertTriangle, X } from 'lucide-react'
 
 interface Props {
@@ -16,6 +16,13 @@ interface Props {
 export function ConfirmDialog({ open, title, message, danger = false, typeText = '', confirmText = '确认删除', onConfirm, onCancel }: Props) {
   const [typed, setTyped] = useState('')
   const canConfirm = !danger || (typed.trim() === typeText)
+
+  // 弹窗以 open 属性控制显隐、组件本身常驻挂载:必须每次"关闭→打开"或确认文本变化时
+  // 清空输入,否则用同一个名字删第二个条目(如两个 node_modules)时,
+  // 上次输入仍在,第二层"输入名称确认"会被静默绕过。
+  useEffect(() => {
+    setTyped('')
+  }, [open, typeText])
 
   if (!open) return null
 

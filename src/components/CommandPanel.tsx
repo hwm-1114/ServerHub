@@ -43,6 +43,8 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
   // 同命令集内拖拽排序:当前高亮的目标行 id
   const [dropRowId, setDropRowId] = useState<string | null>(null)
   const [feedback, setFeedback] = useState<{ text: string; kind: 'ok' | 'warn' } | null>(null)
+  // 导入前的覆盖警示:导入是整表覆盖,若文件里缺少本地终端命令会丢数据,必须二次确认
+  const [importWarn, setImportWarn] = useState<{ arr: unknown[]; lostLocal: number; total: number } | null>(null)
 
   // 归一化 serverId:本地终端模式传 undefined/null;内部统一用 string | null
   const serverIdValue = serverId ?? null
@@ -104,8 +106,11 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
     }))
   }
 
+  // 折叠状态约定:值为 null = 已折叠;未记录(undefined)= 默认展开。
+  // 只有"已显式折叠(null)"时才展开,其余情况(含未记录)一律折叠,
+  // 否则首次点击写入 key(仍非 null)会继续被判定为展开,第一下点击被吞掉。
   const toggleGroup = (key: string) => {
-    setExpandedGroups(prev => ({ ...prev, [key]: prev[key] ? null : key }))
+    setExpandedGroups(prev => ({ ...prev, [key]: prev[key] === null ? key : null }))
   }
 
   // 在终端里执行:优先注入到当前活跃会话,否则回退 execute API
@@ -168,11 +173,11 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
   const duplicateCommand = async (cmd: Command) => {
     // 新名称 = 原名 + 递增数字(拉取第三方依赖 → 拉取第三方依赖1 → …)
     const base = cmd.name.replace(/\d+$/, '')
-    // 编号扫描用全量命令表:当前面板列表是按服务器/scope 过滤后的子集,
-    // 同名命令在公共区或其他服务器存在时会在全库撞名
+    // 编号扫描必须用全量命令表(含本地终端命令):当前面板列表是按服务器/scope 过滤后的
+    // 子集,同名命令在公共区、其他服务器或本地命令集里存在时会在全库撞名
     let pool = commands
     try {
-      const all = await apiFetch<Command[]>('/api/commands')
+      const all = await apiFetch<Command[]>('/api/commands?scope=all')
       if (Array.isArray(all) && all.length) pool = all
     } catch { /* 拉不到全量就退回当前列表 */ }
     let maxN = 0
@@ -215,7 +220,10 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
 
   const exportCommands = async () => {
     try {
-      const res = await fetch('/api/commands') // 不带参数=全部命令
+      // 必须用 scope=all:导出要包含本地终端命令集。旧实现调不带参数的 /api/commands
+      // (注释误以为"不带参数=全部命令",实际只返回远程命令),于是导出的文件里没有本地
+      // 命令;而导入是整表覆盖 —— 导出→导入一次就把本地命令集永久删光。
+      const res = await fetch('/api/commands?scope=all')
       const all = await res.json()
       const content = JSON.stringify(all, null, 2)
       if (window.serverhub) {
@@ -256,8 +264,32 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
   }
 
   const doImportText = async (text: string) => {
+    let arr: unknown[]
     try {
-      const arr = parseImportText(text)
+      arr = parseImportText(text)
+    } catch (err) {
+      setFeedback({ text: `导入失败: ${err instanceof Error ? err.message : '未知错误'}`, kind: 'warn' })
+      return
+    }
+    // 导入是"整表覆盖":先算出会不会丢掉本地终端命令集(导出文件里没有它们时),
+    // 会丢就必须让用户看到条数并二次确认,而不是一句"导入成功"就永久删光
+    let lostLocal = 0
+    try {
+      const cur = await apiFetch<Command[]>('/api/commands?scope=all')
+      const curLocal = cur.filter(c => c.scope === 'local').length
+      const incLocal = (arr as Command[]).filter(c => c && (c as Command).scope === 'local').length
+      lostLocal = Math.max(0, curLocal - incLocal)
+    } catch { /* 统计失败不阻断导入 */ }
+    if (lostLocal > 0) {
+      setImportWarn({ arr, lostLocal, total: arr.length })
+      return
+    }
+    await performImport(arr)
+  }
+
+  // 真正的覆盖导入(确认后调用)
+  const performImport = async (arr: unknown[]) => {
+    try {
       const res = await fetch('/api/commands/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -389,18 +421,29 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
     }
   }
 
-  // 同一命令集内拖拽排序:把拖动的命令移到目标行位置(整份顺序交给 /order 重排)
+  // 面板实际显示顺序的 id 列表:先按命令集(分类)首次出现顺序分组,组内保持当前顺序
+  // ——与 renderSection 的渲染顺序完全一致(groups() 用的就是这个分类顺序)
+  const displayOrderedIds = (list: Command[]) => {
+    const cats = Array.from(new Set(list.map(c => c.category)))
+    return cats.flatMap(cat => list.filter(c => c.category === cat).map(c => c.id))
+  }
+
+  // 同一命令集内拖拽排序:把拖动的命令移到目标行位置。
+  // 提交的 ids 必须按【面板显示顺序】而不是原始数组顺序给出:数组顺序同时也是
+  // "分类首次出现顺序",也就是分组的显示顺序。旧实现按原始数组顺序提交,一次跨分组的
+  // 位置变动会把同分区里其它命令集的显示顺序一起改掉,而被拖的那条在自己组内反而没动。
   const reorderCommand = async (draggedId: string, targetId: string) => {
     setDropRowId(null)
     if (draggedId === targetId) return
-    const current = commands.map(c => c.id)
-    const from = current.indexOf(draggedId)
-    if (from < 0) return
-    const next = [...current]
+    const visible = localMode
+      ? displayOrderedIds(localCommands)
+      : [...displayOrderedIds(commonCommands), ...displayOrderedIds(serverCommands)]
+    const from = visible.indexOf(draggedId)
+    if (from < 0 || !visible.includes(targetId)) return
+    const next = [...visible]
     next.splice(from, 1)
-    let to = next.indexOf(targetId)
+    const to = next.indexOf(targetId) // 移除被拖项后再定位落点
     if (to < 0) return
-    // 拖到目标行之前
     next.splice(to, 0, draggedId)
     const res = await fetch('/api/commands/order', {
       method: 'POST',
@@ -510,8 +553,10 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
                       className={`group flex items-center gap-1.5 px-2 py-1.5 text-xs ${
                         dropRowId === cmd.id
                           ? 'bg-accent-500/10 outline outline-1 outline-accent-500/50 relative'
-                          : 'hover:bg-bg-700/30'
-                      }`}
+                          : deleteMode
+                            ? 'cursor-pointer hover:bg-red-500/10'
+                            : 'hover:bg-bg-700/30'
+                      } ${deleteMode && selected.has(cmd.id) ? 'bg-red-500/15' : ''}`}
                     >
                       {/* 删除模式下显示勾选框,默认隐藏 */}
                       {deleteMode && (
@@ -536,12 +581,17 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
                       >
                         <GripVertical size={12} />
                       </span>
+                      {/* 删除模式下整行都是勾选目标:点击行内名称/命令只切换选中,绝不执行命令
+                          (旧实现点击行体直接 runCommand,rm/reboot 等预设会被误注入终端) */}
                       <button
-                        onClick={() => runCommand(cmd)}
-                        className="flex-1 flex items-center gap-2 min-w-0 text-left"
-                        title={cmd.command}
+                        onClick={() => (deleteMode ? toggleSelect(cmd.id) : runCommand(cmd))}
+                        className="flex-1 flex items-center gap-2 min-w-0 text-left cursor-pointer"
+                        title={deleteMode ? (selected.has(cmd.id) ? '取消选择该命令' : '选择该命令') : cmd.command}
                       >
-                        <Play size={11} className="text-accent-400 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                        {/* 删除模式隐藏"执行"图标,避免误以为点击会运行命令 */}
+                        {!deleteMode && (
+                          <Play size={11} className="text-accent-400 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+                        )}
                         {/* 名称最重要:一行显示、完整不截断,占据优先宽度 */}
                         <span className="text-slate-200 whitespace-nowrap">{cmd.name}</span>
                         {/* 详情缩略显示:随侧栏宽度自适应,空间不足时自然被挤掉/省略 */}
@@ -760,6 +810,20 @@ export function CommandPanel({ serverId, isConnected, activeSessionId, embedded 
         confirmText="删除该命令集"
         onConfirm={doDeleteSet}
         onCancel={() => setDeleteSet(null)}
+      />
+
+      {/* 导入覆盖警示:导入是整表覆盖,若文件里不含本地终端命令,确认后它们会被删掉 */}
+      <ConfirmDialog
+        open={!!importWarn}
+        title="导入将覆盖全部命令"
+        message={importWarn
+          ? `导入是整表覆盖(共 ${importWarn.total} 条命令)。当前有 ${importWarn.lostLocal} 条本地终端命令不在该文件里,覆盖后会被删除且无法恢复。\n请先导出一次留底,或改用包含本地命令的导出文件。确定继续导入吗?`
+          : ''}
+        danger
+        typeText="导入"
+        confirmText="覆盖导入"
+        onConfirm={() => { const w = importWarn; setImportWarn(null); if (w) performImport(w.arr) }}
+        onCancel={() => setImportWarn(null)}
       />
     </>
   )

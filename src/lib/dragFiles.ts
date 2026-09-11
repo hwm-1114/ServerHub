@@ -37,6 +37,17 @@ function fileEntryToFile(entry: FileSystemFileEntry, relPath: string): Promise<D
 }
 
 /**
+ * 由「当前远端目录 base + 拖入项相对路径 relPath」算出该文件要上传到的远端目录(不含文件名)。
+ * 拖入文件夹时 relPath 形如 `src/sub/a.txt`(顶层目录名必须保留),据此还原目录层级;
+ * 顶层文件 relPath 就是文件名,直接落到 base。抽成独立函数便于单测覆盖路径映射。
+ */
+export function targetDirForRelPath(base: string, relPath: string): string {
+  const cut = relPath.lastIndexOf('/')
+  if (cut < 0) return base
+  return `${base.replace(/\/+$/, '')}/${relPath.slice(0, cut)}`
+}
+
+/**
  * 收集拖拽中的本地文件。
  * - 现代浏览器(Chrome/Edge/Firefox)用 webkitGetAsEntry 支持文件夹递归;
  * - 老浏览器退回 dataTransfer.files(仅顶层文件)。
@@ -59,7 +70,10 @@ export async function collectDroppedFiles(dt: DataTransfer): Promise<DroppedFile
       if (entry.isFile) {
         files.push(await fileEntryToFile(entry as FileSystemFileEntry, entry.name))
       } else if (entry.isDirectory) {
-        files.push(...(await readDirEntries(entry, '')))
+        // 顶层目录名必须进 relPath(与上面的顶层文件、以及 webkitRelativePath 兜底一致):
+        // 旧实现传 '' 会把文件夹"拍平"到当前目录,两个文件夹里的同名文件落到同一远端路径
+        // 互相覆盖(静默丢文件),而且带子目录时会拼出 <当前目录>/子目录/文件 却没有 mkdir。
+        files.push(...(await readDirEntries(entry, entry.name)))
       }
     }
     return files

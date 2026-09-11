@@ -58,9 +58,11 @@ export function SessionTabs({ servers, sessions, activeSessionId, onSelect, onCr
     if (!dragged || dragged === targetId) return
     const ids = sses.map(s => s.id)
     const from = ids.indexOf(dragged)
-    const to = ids.indexOf(targetId)
-    if (from === -1 || to === -1) return
+    if (from === -1 || !ids.includes(targetId)) return
     ids.splice(from, 1)
+    // 目标下标必须在移除被拖动项之后重新计算:from < to 时目标已左移一格,
+    // 沿用旧下标会落到目标之后(向右拖落点偏移一格,与向左拖不对称)
+    const to = ids.indexOf(targetId)
     ids.splice(to, 0, dragged)
     onReorder(serverId, ids)
   }

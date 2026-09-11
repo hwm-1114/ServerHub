@@ -1,4 +1,11 @@
 {
+  // 类型检查范围刻意只有 src/(浏览器端 TS 源码)——见文件末尾的 include 说明。
+  // server/ scripts/ electron/ 是纯 JS(ESM / CJS),实测在
+  // `--allowJs --checkJs --strict` 下 server/ 报 294 个错误、scripts/ 报 582 个,
+  // 因此这里不开 allowJs/checkJs(一开 npm run typecheck 立刻爆红,谁也不会看)。
+  // 这三个目录的"未定义标识符"由 eslint 的 no-undef 兜底(见 eslint.config.js 末尾的
+  // Node / CommonJS 两个块):历史事故是 server/ssh-manager.js 丢了一行常量定义,
+  // 跑到该路由才抛 ReferenceError,而当时的 typecheck(只看 src)与 lint(no-undef 关着)全绿。
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
@@ -20,5 +27,7 @@
       "@/*": ["src/*"]
     }
   },
+  // 只检查 src/:不含 server/、scripts/、electron/(原因见文件开头注释,
+  // 那三个目录的未定义标识符改由 eslint 的 no-undef 负责)。
   "include": ["src"],
 }

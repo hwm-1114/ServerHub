@@ -12,13 +12,17 @@ import { SkinPicker } from './components/SkinPicker'
 import { SKIN_STORAGE_KEY, DEFAULT_SKIN } from './lib/skins'
 import { stripAnsi } from './lib/ansi'
 import { Server, ConnectionStatus, Session, LocalFavorite, MAX_SESSIONS_PER_SERVER } from './types'
-import { Terminal as TerminalIcon, FolderTree, Server as ServerIcon, Plus, X, TerminalSquare, Copy, Check, Smartphone } from 'lucide-react'
+import { Terminal as TerminalIcon, FolderTree, Server as ServerIcon, Plus, X, TerminalSquare, Copy, Check, Smartphone, AlertTriangle } from 'lucide-react'
 
 type Tab = 'terminal' | 'files'
 type SidebarView = 'servers' | 'commands' | 'local'
 
 function App() {
   const [servers, setServers] = useState<Server[]>([])
+  // 后端异常横幅(非数组响应/连不上后端/需要访问令牌),避免静默白屏
+  const [bootError, setBootError] = useState('')
+  // 拖到非投放区的提示(阻止浏览器默认"打开文件"导航后给用户一个交代)
+  const [dropHint, setDropHint] = useState('')
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
   const [statuses, setStatuses] = useState<Record<string, ConnectionStatus>>({})
   const [sessions, setSessions] = useState<Session[]>([])
@@ -72,9 +76,24 @@ function App() {
   }, [skin])
 
   const fetchServers = useCallback(async () => {
-    const res = await fetch('/api/servers')
-    const data = await res.json()
-    setServers(data)
+    try {
+      const res = await fetch('/api/servers')
+      const data = await res.json().catch(() => null)
+      // 后端返回非数组(401 未授权 / 500 错误体 / 代理返回 HTML)时绝不能直接塞进 state:
+      // Sidebar 渲染里会 servers.filter/map → TypeError → React 卸载整棵树 = 白屏,
+      // 用户连"需要访问令牌"都看不到。这里改为保留原列表 + 顶部横幅提示。
+      if (!res.ok || !Array.isArray(data)) {
+        const errMsg = (data && typeof data === 'object' && typeof (data as { error?: unknown }).error === 'string' && (data as { error: string }).error) || ''
+        setBootError(res.status === 401
+          ? `后端要求访问令牌:请在地址后追加 ?token=你的令牌 重新打开(当前 ${location.origin} 未携带有效令牌)${errMsg ? ` · ${errMsg}` : ''}`
+          : `无法加载服务器列表:${errMsg || `HTTP ${res.status}`}`)
+        return
+      }
+      setBootError('')
+      setServers(data)
+    } catch (err) {
+      setBootError(`无法连接后端:${err instanceof Error ? err.message : '未知错误'}(请确认后端已启动)`)
+    }
   }, [])
 
   const fetchStatuses = useCallback(async () => {
@@ -97,6 +116,13 @@ function App() {
     return () => clearInterval(interval)
   }, [fetchStatuses])
 
+  // 拖到非投放区的提示:短暂显示后自动消失
+  useEffect(() => {
+    if (!dropHint) return
+    const t = setTimeout(() => setDropHint(''), 2600)
+    return () => clearTimeout(t)
+  }, [dropHint])
+
   // 加载本地目录收藏
   const fetchLocalFavorites = useCallback(async () => {
     try {
@@ -113,7 +139,12 @@ function App() {
   // 合并某服务器最新会话到本地状态,并确保 active 属于该服务器
   const loadSessions = useCallback(async (serverId: string, preferAutoCreate: boolean) => {
     const res = await fetch(`/api/servers/${serverId}/sessions`)
-    let list: Session[] = await res.json()
+    let list: Session[] = await res.json().catch(() => null)
+    // 非数组(错误体)时不能往下走:[...prev, ...list] 会抛 "list is not iterable" → 白屏
+    if (!res.ok || !Array.isArray(list)) {
+      setBootError(`无法加载该服务器的会话列表(HTTP ${res.status})`)
+      return
+    }
     if (preferAutoCreate && list.length === 0) {
       const created = await fetch(`/api/servers/${serverId}/sessions`, {
         method: 'POST',
@@ -138,6 +169,46 @@ function App() {
     }
     loadSessions(selectedServerId, false)
   }, [selectedServerId, loadSessions])
+
+  // 启动(以及服务器列表变化)时把所有服务器的会话都读进来。
+  // 会话记录是持久化的(data/sessions.json),但旧实现只在"选中服务器"或"连接成功"时才加载,
+  // 于是刷新页面/重启应用后前端 sessions 恒为空 → hasSessions=false → 整个远程工作区
+  // (会话标签 + 所有终端)都不渲染,界面退回"开始管理你的服务器":用户看到的就是
+  // "会话都不见了";而重新连接会走 handleConnect→loadSessions,会话又"回来"。
+  // 这里在拿到服务器列表后主动补齐,持久化的会话在任何时候都能直接看到。
+  const sessionsLoadedRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (!servers.length) return
+    const missing = servers.filter(s => !sessionsLoadedRef.current.has(s.id))
+    if (!missing.length) return
+    let cancelled = false
+    ;(async () => {
+      const results = await Promise.all(missing.map(async (s) => {
+        try {
+          const res = await fetch(`/api/servers/${s.id}/sessions`)
+          const list = await res.json().catch(() => null)
+          return { id: s.id, list: (res.ok && Array.isArray(list)) ? (list as Session[]) : [] }
+        } catch {
+          return { id: s.id, list: [] as Session[] }
+        }
+      }))
+      if (cancelled) return
+      for (const r of results) sessionsLoadedRef.current.add(r.id)
+      const withSessions = results.filter(r => r.list.length > 0)
+      if (!withSessions.length) return
+      setSessions(prev => {
+        const next = [...prev]
+        for (const r of withSessions) {
+          const others = next.filter(x => x.serverId !== r.id)
+          others.push(...r.list)
+          next.length = 0
+          next.push(...others)
+        }
+        return next
+      })
+    })()
+    return () => { cancelled = true }
+  }, [servers])
 
   // 只要存在会话就自动激活第一个,让终端区/顶部栏直接可用(无需先在左侧点击服务器)
   useEffect(() => {
@@ -464,7 +535,34 @@ function App() {
   ]
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden">
+    <div
+      className="flex h-screen w-screen overflow-hidden"
+      // ===== 拖放兜底 =====
+      // 只有各面板内部实现了投放区;侧栏/顶栏/终端区都没有。Chromium 对"未被 preventDefault
+      // 的文件拖放"默认动作是【打开该文件】,会直接把整个 SPA(连同全部终端 WS 会话)替换掉,
+      // 桌面版还没有地址栏/后退键。这里在根节点兜底:取消默认行为 + 给一句明确提示。
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types?.includes('Files')) e.preventDefault()
+      }}
+      onDrop={(e) => {
+        // 子级投放区(文件页上传区/本机面板/设备面板)已 preventDefault,这里只兜"没人管"的落点
+        if (e.defaultPrevented) return
+        if (e.dataTransfer?.types?.includes('Files')) {
+          e.preventDefault()
+          setDropHint(activeTab === 'files'
+            ? '请把文件拖到右侧文件列表区域上传,或点工具栏的上传按钮'
+            : '拖拽上传请先切到《文件》页,再把文件拖到列表区域')
+        }
+      }}
+    >
+      {/* 后端异常横幅(非数组响应/连不上后端/需要访问令牌) */}
+      {bootError && (
+        <div className="fixed top-0 left-0 right-0 z-[60] px-4 py-2 bg-amber-500/15 border-b border-amber-500/40 text-amber-200 text-xs flex items-center gap-2">
+          <AlertTriangle size={13} />
+          <span className="flex-1">{bootError}</span>
+          <button className="text-amber-300/80 hover:text-amber-100" onClick={() => setBootError('')}>关闭</button>
+        </div>
+      )}
       {/* 侧边栏 */}
       <Sidebar
         servers={servers}
@@ -655,11 +753,21 @@ function App() {
                   <span className="text-sm font-semibold text-slate-200">{activeServer?.name ?? '未选择服务器'}</span>
                 </div>
                 <span className="text-xs text-slate-500">{activeServer ? `${activeServer.host}:${activeServer.port}` : ''}</span>
-                <span className={`text-xs font-medium ${
-                  isConnected ? 'status-connected' : 'status-disconnected'
-                }`}>
-                  ● {isConnected ? '已连接' : (activeServerId ? (statuses[activeServerId] || '断开') : '')}
-                </span>
+                {/* 连接状态本身也是开关:点一下即可连接/断开(不再只能去侧栏设置菜单里找) */}
+                {activeServerId && (
+                  <button
+                    onClick={() => statuses[activeServerId] === 'connected' ? handleDisconnect(activeServerId) : handleConnect(activeServerId)}
+                    disabled={statuses[activeServerId] === 'connecting'}
+                    title={isConnected ? '断开连接' : '连接服务器'}
+                    className={`text-xs font-medium px-2 py-0.5 rounded-md border transition-colors ${
+                      isConnected
+                        ? 'text-accent-400 border-accent-500/30 bg-accent-500/10 hover:text-red-400 hover:border-red-500/40'
+                        : 'text-slate-400 border-slate-700 bg-bg-800/60 hover:text-accent-400 hover:border-accent-500/40'
+                    }`}
+                  >
+                    ● {isConnected ? '已连接' : (statuses[activeServerId] || '断开')}
+                  </button>
+                )}
               </div>
 
               {/* Tab 切换 */}
@@ -772,6 +880,13 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* 拖到非投放区的提示(根节点已阻止浏览器默认的"打开文件"行为) */}
+      {dropHint && (
+        <div className="fixed bottom-16 left-1/2 -translate-x-1/2 z-[60] px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-200 text-xs">
+          {dropHint}
+        </div>
+      )}
 
       {/* 动态特效皮肤:全屏氛围层,pointer-events:none 且低于弹窗层级,零功能影响 */}
       {skin !== DEFAULT_SKIN && (

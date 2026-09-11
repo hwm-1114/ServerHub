@@ -27,6 +27,13 @@ const FONT = [58, 72, 100]         // 终端窗口描边
 function lerp(a, b, t) { return a + (b - a) * t }
 function mix(c1, c2, t) { return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)] }
 
+// 矩形色块的透明度:到色块中心的距离 d ≤ core 时完全不透明,再向外到 half 线性渐隐到 0
+// (half = 半宽/半高,core = 实心芯半径)。下划线与光标块都用它做边缘抗锯齿。
+// 注意 half 必须大于 core,否则会出现 1 - half/half 恒等于 0 的"永远画不出来"。
+function bandAlpha(d, half, core) {
+  return Math.max(0, Math.min(1, (half - d) / (half - core)))
+}
+
 // 圆角矩形 SDF
 function sdRounded(x, y, cx, cy, hw, hh, r) {
   const dx = Math.abs(x - cx) - (hw - r)
@@ -107,15 +114,22 @@ function sample(sx, sy) {
   col = mix(col, PROMPT, chevCol * winFill)
 
   // 提示文本下划线(模拟输入内容)
-  const under = (y >= baseY - 0.012 && y <= baseY + 0.012 && x > baseX + 0.045 && x < tx + tw / 2 - 0.10)
-    ? Math.max(0, Math.min(1, 1 - 0.012 / 0.012)) : 0
+  // 修复:旧写法算的是 `1 - 0.012 / 0.012`,恒等于 0 —— 这段色块从来没被画出来过,
+  // 现在按"到色块中心的归一化距离"衰减(半高 0.012,芯部 0.006 内实心,向外渐隐)。
+  const underDy = Math.abs(y - baseY)
+  const under = (x > baseX + 0.045 && x < tx + tw / 2 - 0.10 && underDy < 0.012)
+    ? bandAlpha(underDy, 0.012, 0.006) : 0
   const accentLine = mix(BAR, TXT, 0.8)
   col = mix(col, accentLine, under * winFill * 0.5)
 
   // 光标块(闪烁感,固定为亮块)
+  // 同样修复 `1 - 0.016 / 0.016` 恒为 0:按 x/y 两轴"到块中心的归一化距离"取较大者衰减,
+  // 得到边缘渐隐的实心亮块(芯部 55% 不透明,其余渐隐)。
   const curX = baseX + 0.030
-  const cur = (y >= baseY - 0.016 && y <= baseY + 0.016 && x >= curX - 0.015 && x <= curX + 0.015)
-    ? Math.max(0, Math.min(1, 1 - 0.016 / 0.016)) : 0
+  const curDx = Math.abs(x - curX) / 0.015
+  const curDy = Math.abs(y - baseY) / 0.016
+  const cur = (curDx < 1 && curDy < 1)
+    ? bandAlpha(Math.max(curDx, curDy), 1, 0.55) : 0
   col = mix(col, CURSOR, cur * winFill * 0.92)
 
   return [col[0], col[1], col[2], 255]

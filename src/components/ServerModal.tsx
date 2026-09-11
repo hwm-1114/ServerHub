@@ -15,16 +15,39 @@ export function ServerModal({ server, onSave, onClose }: Props) {
   const [username, setUsername] = useState(server?.username || 'root')
   // 密码明文存储、明文显示(本地/内网工具定位,刻意设计)
   const [password, setPassword] = useState(server?.password || '')
+  // 私钥(PEM 全文,可选):后端 getServerConfig 在有 privateKey 时只用私钥、忽略密码。
+  // 旧界面完全没有这个字段,而密码又是 required —— 想用密钥登录的服务器根本建不出来。
+  const [privateKey, setPrivateKey] = useState(server?.privateKey || '')
+  const [error, setError] = useState('')
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    const portNum = Number(port)
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      setError('端口需为 1-65535 的整数')
+      return
+    }
+    // 主机/用户名去掉首尾空白:从文档里粘贴常带空格,直接存会导致连接失败且报错难懂
+    const h = host.trim()
+    const u = username.trim()
+    if (!h || !u) { setError('IP 地址与用户名不能为空'); return }
+    if (!password && !privateKey.trim()) {
+      setError('请填写密码,或粘贴私钥(二者至少填一个)')
+      return
+    }
+    setError('')
     const result: Server = {
       id: server?.id || `srv-${Date.now()}`,
-      name: name || host,
-      host,
-      port: Number(port) || 22,
-      username,
-      password: password || server?.password || '',
+      name: name.trim() || h,
+      host: h,
+      port: portNum,
+      username: u,
+      // 密码明文存储、明文编辑:保存用户输入的原值(含空字符串)。
+      // 不能再回退到 server?.password —— 那会让"清空密码"变成静默保留旧密码。
+      // 编辑时输入框已预填现有明文密码,不动它即为保留。
+      password,
+      // 私钥:空串表示"清掉私钥"(回到密码认证)
+      privateKey: privateKey.trim(),
     }
     if (server?.createdAt) result.createdAt = server.createdAt
     onSave(result)
@@ -101,12 +124,27 @@ export function ServerModal({ server, onSave, onClose }: Props) {
             <input
               className="input font-mono"
               type="text"
-              placeholder="输入密码"
+              placeholder="输入密码(用私钥认证时可留空)"
               value={password}
               onChange={e => setPassword(e.target.value)}
-              {...(!server && { required: true })}
             />
           </div>
+
+          <div>
+            <label className="label">私钥(可选,粘贴 PEM 全文)</label>
+            <textarea
+              className="input font-mono text-[11px] h-24 resize-y"
+              placeholder={'-----BEGIN OPENSSH PRIVATE KEY-----\n…\n-----END OPENSSH PRIVATE KEY-----'}
+              value={privateKey}
+              onChange={e => setPrivateKey(e.target.value)}
+              spellCheck={false}
+            />
+            <p className="text-[11px] text-slate-500 mt-1">填了私钥则只用私钥认证(忽略上面的密码);清空即回到密码认证。</p>
+          </div>
+
+          {error && (
+            <div className="px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">{error}</div>
+          )}
 
           <div className="flex justify-end gap-2 pt-2">
             <button type="button" onClick={onClose} className="btn-ghost">取消</button>

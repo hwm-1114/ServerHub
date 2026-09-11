@@ -5,7 +5,8 @@ import {
 } from 'lucide-react'
 import { LocalFavorite } from '../types'
 import { DND_MIME, makeDndData, readDndData, DndFile } from './DeviceFilePanel'
-import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit } from '../lib/sizeFormat'
+import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit, onSizeUnitChange } from '../lib/sizeFormat'
+import { onLocalRefresh, requestDeviceRefresh } from '../lib/uiBus'
 
 interface Props {
   /** 当前浏览目录(由 App 管理,空串表示磁盘根层) */
@@ -90,6 +91,8 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
   const [lastDevicePath, setLastDevicePath] = useState('')
   // 文件大小显示单位(默认字节)
   const [unit, setUnitState] = useState<SizeUnit>(() => getSizeUnit())
+  // 其它面板改了大小单位时同步(单位是全局偏好,同屏两处显示不能不一致)
+  useEffect(() => onSizeUnitChange(setUnitState), [])
   // 设备文件拖入下载:高亮的目标本地目录(空串=当前目录根部)
   const [dropDir, setDropDir] = useState<string | null>(null)
   const dropDirRef = useRef<string | null>('')
@@ -100,24 +103,32 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
   const [batchDevicePath, setBatchDevicePath] = useState('')
   const [batchBusy, setBatchBusy] = useState(false)
 
+  const browseSeqRef = useRef(0)
   const fetchBrowse = useCallback(async (path: string) => {
+    // 请求序号:快速切换目录时,慢的旧响应不能覆盖新目录的列表
+    const seq = ++browseSeqRef.current
     setLoading(true)
     try {
       const res = await fetch(`/api/local/browse?path=${encodeURIComponent(path)}`)
       const data = await res.json()
+      if (seq !== browseSeqRef.current) return
       setEntries(data.entries || [])
       setNote(data.note || '')
     } catch {
+      if (seq !== browseSeqRef.current) return
       setEntries([])
       setNote('浏览失败')
     } finally {
-      setLoading(false)
+      if (seq === browseSeqRef.current) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
     fetchBrowse(browsePath)
   }, [browsePath, fetchBrowse])
+
+  // 别处(设备面板批量下载等)写了本机磁盘后通知刷新,否则用户在这里看不到新文件
+  useEffect(() => onLocalRefresh(() => fetchBrowse(browsePath)), [fetchBrowse, browsePath])
 
   // 加载记住的 hdc 传输地址
   useEffect(() => {
@@ -276,7 +287,13 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
     for (const f of list) {
       const err = await transferDeviceToLocal(f.path, targetDir)
       if (err) fails.push(`${f.name}: ${err}`); else ok++
-      if (ok === 1 && !err) { setLastDevicePath(f.path); saveState({ devicePath: f.path, localDir: targetDir }) }
+      if (ok === 1 && !err) {
+        // 记住的"上次使用的设备路径"必须是【目录】:旧实现存的是刚下载的那个文件路径,
+        // 之后批量上传的"设备目录"输入框会被自动填成这个文件路径 —— 多个本机文件全部
+        // 发往同一个目标文件(覆盖设备上同名文件或整批失败)。这里改为存它的父目录。
+        const parentDir = f.path.includes('/') ? (f.path.slice(0, f.path.lastIndexOf('/')) || '/') : '/'
+        setLastDevicePath(parentDir); saveState({ devicePath: parentDir, localDir: targetDir })
+      }
     }
     setBusy(null)
     if (fails.length === 0) showToast(`已下载 ${ok}/${list.length} 个文件 → ${targetDir}`)
@@ -359,6 +376,8 @@ export function LocalDirBrowser({ browsePath, onBrowsePathChange, favorites, onT
     setSelectMode(false)
     setLastDevicePath(target)
     saveState({ devicePath: target })
+    // 通知设备文件面板刷新:否则侧栏批量上传后设备列表仍是旧内容,用户以为没传上去
+    if (ok > 0) requestDeviceRefresh()
     if (fails.length === 0) showToast(`已上传 ${ok}/${files.length} 个文件到设备`)
     else {
       const head = fails.slice(0, 2).join('；')

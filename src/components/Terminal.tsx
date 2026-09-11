@@ -60,6 +60,8 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
   // 自连接以来收到的原始字节块(查看完整历史的"重建视图"回放用;TUI 程序输出
   // 只有经过终端状态机回放才能还原成可读内容)。含退出全屏前的抓屏快照。
   const fullBytesRef = useRef<Uint8Array[]>([])
+  // 累积历史文本用的流式解码器(整条会话复用一个实例,详见下方 data 分支的说明)
+  const decoderRef = useRef<TextDecoder | null>(null)
 
   const showToast = (text: string, kind: 'ok' | 'warn' = 'ok') => {
     setToast({ text, kind })
@@ -291,6 +293,7 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
       unregisterTerminalFocus(session.id)
       fullContentRef.current = ''
       fullBytesRef.current = []
+      decoderRef.current = null // 累积历史已清空,解码器同时作废:残留的半个字符不得流到下次连接
       if (wsRef.current) {
         wsRef.current.close()
         wsRef.current = null
@@ -348,10 +351,17 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
           registerTerminalFocus(session.id, () => { termRef.current?.focus() })
           fullContentRef.current = ''
           fullBytesRef.current = []
+          decoderRef.current = null // 与累积缓冲同时重置:新连接的解码必须从零状态开始
         } else if (msg.type === 'data') {
           // 还原成 UTF-8 字节再写入,避免多字节字符(边框符等)乱码
           const bytes = decodeBase64ToBytes(msg.data)
-          fullContentRef.current += new TextDecoder().decode(bytes) // 累积全部输出,导出不限大小
+          // 累积历史文本必须用"整条会话唯一、流式"的 decoder:WS 分片边界可能正好落在
+          // 一个多字节字符中间(实测 3MB 中文输出约有 100 帧如此),每帧新建一个非流式
+          // TextDecoder 会把被切断的字符在前后两帧各毁一次,累积文本里出现大量 U+FFFD,
+          // 导出 txt / 查看完整历史 就都是乱码。stream:true 会把半个字符留在解码器内部,
+          // 与下一帧拼合后再输出。字节留档与实时终端写入(xterm 直接吃字节)不受影响。
+          if (!decoderRef.current) decoderRef.current = new TextDecoder()
+          fullContentRef.current += decoderRef.current.decode(bytes, { stream: true })
           fullBytesRef.current.push(bytes) // 原始字节留档,供完整历史重建视图回放
           const atBottom = wasAtBottom()
           termRef.current?.write(bytes)
@@ -380,7 +390,7 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
       }
     })
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       // 仅当关闭的是当前 WS(即不是被热切换/卸载清理掉的旧连接)时才提示并清引用
       if (wsRef.current === ws) {
         wsRef.current = null
@@ -388,9 +398,19 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
         unregisterTerminalExporter(session.id)
         unregisterTerminalFocus(session.id)
         setConnected(false)
-        termRef.current?.writeln(`\r\n\x1b[33m⚠ 连接已断开\x1b[0m`)
-        // 有限退避重连:最多 3 次(1s/2s/3s),之后需要手动重连,避免死循环
-        if (retryRef.current < 3) {
+        // 服务端主动关闭时会带上原因(如"每台服务器最多 20 个会话,请先关闭部分会话"、
+        // "未授权:缺少或错误的访问令牌"),必须原样显示给用户,否则只看到"连接已断开",
+        // 完全不知道失败原因(会话超限/令牌错误重试多少次都不会成功)
+        if (event.reason) {
+          termRef.current?.writeln(`\r\n\x1b[31m✗ ${event.reason}\x1b[0m`)
+        } else {
+          termRef.current?.writeln(`\r\n\x1b[33m⚠ 连接已断开\x1b[0m`)
+        }
+        // 1008 = 策略违规(未授权 / 会话数超限):重试必然再次被拒,不做有限自动重连
+        if (event.code === 1008) {
+          termRef.current?.writeln(`\r\n\x1b[31m✗ 未自动重连,请按上述提示处理后手动重新连接\x1b[0m`)
+        } else if (retryRef.current < 3) {
+          // 有限退避重连:最多 3 次(1s/2s/3s),之后需要手动重连,避免死循环
           const delay = 1000 * (retryRef.current + 1)
           retryRef.current += 1
           retryTimerRef.current = setTimeout(() => {

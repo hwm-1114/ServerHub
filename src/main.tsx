@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import './index.css'
 import './skins.css'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { initAccessToken, getAccessToken } from './lib/token'
 
 // 首次进入:URL ?token=xxx 带入访问令牌并持久化(见 lib/token.ts)
@@ -25,6 +26,9 @@ if (typeof window !== 'undefined') {
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    {/* 最外层兜底:渲染异常不许白屏(见 ErrorBoundary 注释) */}
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 )

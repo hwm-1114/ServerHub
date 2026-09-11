@@ -229,31 +229,68 @@ app.get('/api/servers/:id/files/content', async (req, res) => {
 app.get('/api/servers/:id/files/download', async (req, res) => {
   const filePath = req.query.path
   if (!filePath) return res.status(400).json({ error: '缺少 path 参数' })
+  // 绝不能在这里再 decodeURIComponent:express 的 req.query 已经把百分号编码解过一次,
+  // 二次解码会把文件名里的 % 破坏成别的字符——真机实测:下载 100%25.txt 拿到的是
+  // 100%.txt 的内容(串文件),文件名里 % 后不是合法十六进制时直接 500 URI malformed。
+  const remotePath = String(filePath)
   try {
     // 走独立文件连接(ensureFileClient+getFileSftp),复用单个 sftp 会话并带通道耗尽自愈,
     // 绝不占用终端连接通道,也不触发终端 disconnect —— 与列目录/读文件保持一致。
     await ensureFileClient(req.params.id)
     const sftp = await retryFileAfterReconnect(req.params.id, () => getFileSftp(req.params.id))
-    const fileName = decodeURIComponent(filePath).split('/').filter(Boolean).pop() || 'file'
+    const fileName = remotePath.split('/').filter(Boolean).pop() || 'file'
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`)
-    // 先取文件大小,成功则设置 Content-Length 以便前端显示下载进度;
-    // 取不到(权限等)就流式传输,进度显示"…"
-    sftp.stat(decodeURIComponent(filePath), (statErr, stat) => {
-      if (!statErr && stat && stat.size != null) {
-        try { res.setHeader('Content-Length', String(stat.size)) } catch {}
+    // 先 stat:能拿到大小就设 Content-Length(前端显示进度),顺带把"目标是目录""文件不存在"
+    // 这类错误变成中文可读提示(旧实现把 sshd 的 "Failure"/"No such file" 原样抛给用户)
+    sftp.stat(remotePath, (statErr, stat) => {
+      if (!statErr && stat) {
+        if (stat.isDirectory()) {
+          if (!res.headersSent) res.status(400).json({ error: '目标是目录,不能直接下载(请先打包或进入目录选择文件)' })
+          return
+        }
+        if (stat.size != null) { try { res.setHeader('Content-Length', String(stat.size)) } catch {} }
+      } else if (statErr && statErr.code === 2) {
+        if (!res.headersSent) res.status(404).json({ error: `远端文件不存在:${remotePath}` })
+        return
       }
-      const rs = sftp.createReadStream(decodeURIComponent(filePath))
+      // stat 失败但不是"不存在"(如权限受限)时保持旧行为:不带长度直接流式试一次
+      const rs = sftp.createReadStream(remotePath)
       rs.on('error', (e) => {
-        if (!res.headersSent) res.status(500).json({ error: e.message })
+        if (!res.headersSent) res.status(500).json({ error: sftpErrText(e) })
         res.destroy()
       })
       rs.pipe(res)
     })
   } catch (err) {
-    if (!res.headersSent) res.status(500).json({ error: err.message })
+    if (!res.headersSent) res.status(500).json({ error: sftpErrText(err) })
   }
 })
 // ========== 本机 ↔ 远端互传(local-to-remote / remote-to-local) ==========
+// SFTP 原始错误大多是英文且语焉不详("Failure" / "No such file"),直接抛给用户无法理解
+// 也无法自救。这里统一翻译成中文,并保留原文便于定位(真机实测:上传到不存在的子目录
+// 只会看到 {"error":"No such file"})。
+function sftpErrText(err) {
+  const msg = (err && err.message) || String(err || '未知错误')
+  const code = err && err.code
+  if (code === 2 || /no such file|not exist|no such/i.test(msg)) {
+    return `远端路径不存在(父目录可能未创建或被移动):${msg}`
+  }
+  if (code === 3 || /permission denied/i.test(msg)) {
+    return `权限不足:${msg}`
+  }
+  if (/not a directory|ENOTDIR/i.test(msg)) {
+    return `路径中有一级不是目录:${msg}`
+  }
+  if (/no space left/i.test(msg)) {
+    return `远端磁盘空间不足:${msg}`
+  }
+  if (code === 4 || /^failure$/i.test(msg)) {
+    return `远端操作失败(常见于目标已存在、不可写或类型不符):${msg}`
+  }
+  return msg
+}
+
+
 // 响应只发一次:两条路由的多个错误来源(源流/目标流/核对/清理)共享一个出口,
 // 旧实现的错误回调没有防重,叠加失败时会 double-response 抛 ERR_HTTP_HEADERS_SENT。
 function makeRespondOnce(res) {
@@ -267,8 +304,9 @@ function makeRespondOnce(res) {
 
 // 传输看护阈值:与 hdc 传输的 30min 上限对齐;空闲 60s 无字节进展即中止
 // (SFTP 半开连接时 close/error 都不会来,旧实现会前后端一起永久挂起)
-const TRANSFER_TOTAL_TIMEOUT = 30 * 60 * 1000
-const TRANSFER_IDLE_TIMEOUT = 60 * 1000
+// 可用环境变量覆盖,便于离线回归用毫秒级阈值验证看护逻辑(生产不设置即用默认值)
+const TRANSFER_TOTAL_TIMEOUT = Number(process.env.SERVERHUB_TRANSFER_TOTAL_MS || 30 * 60 * 1000)
+const TRANSFER_IDLE_TIMEOUT = Number(process.env.SERVERHUB_TRANSFER_IDLE_MS || 60 * 1000)
 
 // 本机↔远端单文件互传的公共管道收尾,两条路由共用:
 // - 任一端出错:destroy 两端流 → 清理半成品 → 立即报错。旧实现读流出错只回 500
@@ -442,7 +480,25 @@ app.post('/api/servers/:id/files/upload', async (req, res) => {
     // 用 sftp.stat 核对远端真实大小与 Content-Length:若服务器少写了字节,文件就会
     // "静默变小",此时必须删除半成品并报错,而不是悄悄返回成功。
     await new Promise((resolve, reject) => {
-      const fail = (e) => { try { writeStream.destroy() } catch {}; reject(e) }
+      let settled = false
+      // 看护超时:与 local-to-remote/remote-to-local 用同一套阈值。
+      // 半开连接(NAT 超时/链路静默中断)时 req 既不会 end 也不会 error,写流永远不 close,
+      // 旧实现会让这个请求和一条 SFTP 通道永久挂住;真机实测有效带宽只有 0.4~0.9MB/s,
+      // 慢链路是常态,所以必须有"空闲多久没进展就中止"的兜底。
+      let lastActivity = Date.now()
+      const started = Date.now()
+      let timer = null
+      const done = (fn) => { if (settled) return; settled = true; if (timer) clearInterval(timer); fn() }
+      const fail = (e) => done(() => { try { writeStream.destroy() } catch {}; reject(e) })
+      req.on('data', () => { lastActivity = Date.now() })
+      timer = setInterval(() => {
+        const now = Date.now()
+        if (now - lastActivity > TRANSFER_IDLE_TIMEOUT) {
+          fail(new Error(`上传超时中止:${TRANSFER_IDLE_TIMEOUT / 1000} 秒无数据进展(连接可能已中断),已清理半成品,请重试`))
+        } else if (now - started > TRANSFER_TOTAL_TIMEOUT) {
+          fail(new Error(`上传超时中止:总时长超过 ${TRANSFER_TOTAL_TIMEOUT / 60000} 分钟,已清理半成品,请重试`))
+        }
+      }, 1000)
       req.on('error', fail)
       writeStream.on('error', fail)
       req.on('end', () => writeStream.end())
@@ -452,12 +508,12 @@ app.post('/api/servers/:id/files/upload', async (req, res) => {
             sftp.stat(remotePath, (statErr, stat) => statErr ? rej2(statErr) : res2(stat))
           })
           if (expected !== null && size !== expected) {
-            reject(new Error(`上传不完整:远端 ${size} 字节,预期 ${expected} 字节,可能被服务器截断`))
+            done(() => reject(new Error(`上传不完整:远端 ${size} 字节,预期 ${expected} 字节,可能被服务器截断`)))
             return
           }
-          resolve()
+          done(() => resolve())
         } catch (statErr) {
-          reject(new Error(`无法校验上传结果: ${statErr.message}`))
+          done(() => reject(new Error(`无法校验上传结果: ${statErr.message}`)))
         }
       })
       req.pipe(writeStream)
@@ -467,7 +523,7 @@ app.post('/api/servers/:id/files/upload', async (req, res) => {
   } catch (err) {
     // 传输失败/截断:清理远端残留的半成品,再返回错误
     try { await deletePath(req.params.id, remotePath) } catch {}
-    if (!res.headersSent) res.status(500).json({ error: err.message })
+    if (!res.headersSent) res.status(500).json({ error: sftpErrText(err) })
     else res.end()
   }
 })
@@ -480,10 +536,11 @@ app.delete('/api/servers/:id/files', async (req, res) => {
     // 删除走独立文件连接,不依赖终端连接
     await ensureFileClient(req.params.id)
     const recursive = req.query.recursive !== 'false'
-    const result = await retryFileAfterReconnect(req.params.id, () => deletePath(req.params.id, decodeURIComponent(filePath), { recursive }))
+    // 同样不能二次 decodeURIComponent:否则删的是被破坏后的另一个路径(真机实测删错文件)
+    const result = await retryFileAfterReconnect(req.params.id, () => deletePath(req.params.id, String(filePath), { recursive }))
     res.json({ success: true, result })
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: sftpErrText(err) })
   }
 })
 
@@ -503,16 +560,18 @@ app.post('/api/servers/:id/files/rename', async (req, res) => {
   }
 })
 
-// 新建目录:body { path }(完整目录路径,递归创建,已存在报错)
+// 新建目录:body { path, existOk? }(完整目录路径,递归创建)
+// existOk=true 时"已存在且是目录"视为成功(mkdir -p 语义),供拖入文件夹上传前补建父目录;
+// 默认 false 时路径已存在则报错,避免建目录对话框里的静默成功。
 app.post('/api/servers/:id/files/mkdir', async (req, res) => {
   const { path: dir } = req.body || {}
   if (!dir) return res.status(400).json({ error: '缺少 path' })
   try {
     await ensureFileClient(req.params.id)
-    await retryFileAfterReconnect(req.params.id, () => makeDirectory(req.params.id, String(dir)))
+    await retryFileAfterReconnect(req.params.id, () => makeDirectory(req.params.id, String(dir), { existOk: !!(req.body && req.body.existOk) }))
     res.json({ success: true })
   } catch (err) {
-    res.status(500).json({ error: err.message })
+    res.status(500).json({ error: sftpErrText(err) })
   }
 })
 
@@ -614,6 +673,12 @@ function isCommonCommand(c) {
 // 命令按 scope 分为两套互不共享:远程命令集(缺省/'server')与本地终端命令集('local')
 app.get('/api/commands', (req, res) => {
   let commands = readCommands()
+  // ?scope=all:返回全部(含本地终端命令)。供"导出命令"与"复制命令时按全库编号"使用 ——
+  // 旧实现这两处都调不带参数的接口(那会儿只返回远程命令),结果是导出的文件里没有
+  // 本地终端命令,而导入是整表覆盖:导出→导入一次就把本地命令集永久删光。
+  if (req.query.scope === 'all') {
+    return res.json(commands)
+  }
   // ?scope=local / ?local=1:只返回本地终端命令
   if (req.query.local === '1' || req.query.scope === 'local') {
     return res.json(commands.filter(c => c.scope === 'local'))
@@ -688,20 +753,25 @@ app.delete('/api/commands/:id', async (req, res) => {
   res.json({ success: true })
 })
 
-// 调整命令顺序:按传入的 ids 顺序重排整份命令数组(用于同命令集内拖拽排序)
+// 调整命令顺序:把传入 ids 的顺序应用到"这些命令"上(用于同命令集内拖拽排序)。
+// 关键:未出现在 ids 里的命令【保持原位】——前端只提交它当前能看到的子集
+// (公共 + 本服务器,或本地终端命令),旧实现把未提交的命令整段追加到数组末尾,
+// 结果拖动一条命令会连带改掉其它服务器命令/本地命令的位置,而且面板是按"分类在
+// 数组中的首次出现顺序"分组的,同分区里其它命令集的显示顺序会因此被打乱、被拖的
+// 那条自己却没动(真机/离线均复现)。
 app.post('/api/commands/order', async (req, res) => {
   const { ids } = req.body
   if (!Array.isArray(ids)) return res.status(400).json({ error: '缺少 ids' })
   const result = await mutateCommands(list => {
     const byId = new Map(list.map(c => [c.id, c]))
+    const ordered = []
     const used = new Set()
-    const out = []
     for (const id of ids) {
-      if (byId.has(id) && !used.has(id)) { out.push(byId.get(id)); used.add(id) }
+      if (byId.has(id) && !used.has(id)) { ordered.push(byId.get(id)); used.add(id) }
     }
-    // 未出现在 ids 里的命令保持原有相对顺序,附加到末尾
-    for (const c of list) if (!used.has(c.id)) out.push(c)
-    return out
+    // 逐个把"被提交的位置"换成新顺序里的命令,其余命令原地不动
+    let k = 0
+    return list.map(c => (used.has(c.id) ? ordered[k++] : c))
   })
   res.json(result)
 })

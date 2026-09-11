@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Folder, File as FileIcon, ArrowUp, HardDrive, Star, X, ChevronRight, Loader2, RefreshCw, Copy, Upload, Download, Computer, FolderOpen, CheckSquare, Square } from 'lucide-react'
 import { LocalFavorite } from '../types'
 import { DND_MIME, makeDndData, readDndData, DndFile } from './DeviceFilePanel'
-import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit } from '../lib/sizeFormat'
+import { SIZE_UNITS, getSizeUnit, setSizeUnit, formatSize, SizeUnit, onSizeUnitChange } from '../lib/sizeFormat'
+import { requestRemoteRefresh } from '../lib/uiBus'
 
 interface Props {
   serverId: string
@@ -63,6 +64,8 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
   const dropDirRef = useRef<string | null>('')
   // 文件大小显示单位(默认字节)
   const [unit, setUnitState] = useState<SizeUnit>(() => getSizeUnit())
+  // 其它面板改了大小单位时同步(单位是全局偏好,同屏两处显示不能不一致)
+  useEffect(() => onSizeUnitChange(setUnitState), [])
   // 批量选择:勾选本地文件后一次性上传到远程当前目录
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -73,19 +76,32 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
   const showToast = (t: string, kind: 'ok' | 'warn' = 'ok') => setToast({ text: t, kind })
   useEffect(() => { if (!toast) return; const tm = setTimeout(() => setToast(null), 2200); return () => clearTimeout(tm) }, [toast])
 
+  const browseSeqRef = useRef(0)
   const fetchBrowse = useCallback(async (path: string) => {
+    // 请求序号:快速点大目录再点「上级」时,慢的旧响应不能覆盖新目录的列表
+    // (旧实现无守卫:路径栏是新目录、列表却是旧目录的内容,拖拽上传还会因此拿到错的文件)
+    const seq = ++browseSeqRef.current
     setLoading(true)
     try {
       const res = await fetch(`/api/local/browse?path=${encodeURIComponent(path)}`)
       const d = await res.json()
+      if (seq !== browseSeqRef.current) return
       setEntries(d.entries || []); setNote(d.note || '')
       // 成功进入的目录同步上报父组件:批量"下载选中到本机"用的是父级记录的路径,
       // 初始挂载/手动刷新也走这里,避免父级残留陈旧目录
       onPathChange?.(path)
-    } catch { setEntries([]); setNote('浏览失败') } finally { setLoading(false) }
+    } catch {
+      if (seq !== browseSeqRef.current) return
+      setEntries([]); setNote('浏览失败')
+    } finally {
+      if (seq === browseSeqRef.current) setLoading(false)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   useEffect(() => { fetchBrowse(browsePath) }, [browsePath, fetchBrowse])
+  // 目录一变就清空勾选:勾选的是绝对路径,换了目录后按钮还显示"(N)"就会把
+  // 上一个目录(甚至已不存在)的文件拿去上传
+  useEffect(() => { setSelected(new Set()); selAnchorRef.current = -1 }, [browsePath])
   // 父组件批量下载完成后的刷新通知:只看 refreshSignal 变化,browsePath 取闭包当前值
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { if (refreshSignal) fetchBrowse(browsePath) }, [refreshSignal])
@@ -115,6 +131,10 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
     setSelected(new Set())
     setSelectMode(false)
     reportBatch('已上传', ok, files.length, fails, remoteDir)
+    // 通知远程文件列表刷新:旧实现只弹了"已上传 N/M"的提示,右侧远程列表仍是旧内容,
+    // 用户以为没传上去(甚至重复上传覆盖同名文件)。哪怕部分失败也要刷一次,
+    // 让用户看到实际落地的结果。
+    if (ok > 0) requestRemoteRefresh()
   }
 
   // 切换单个文件选中,并更新 shift 锚点
@@ -234,6 +254,16 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
 
   const handleDrop = async (e: React.DragEvent, targetDir: string) => {
     setDropDir(null)
+    // 磁盘列表态(browsePath 为空)没有可写目标:旧实现会把 '\C:\' 或空串当本地目录
+    // 发给后端(前者 500、后者 400 "缺少 localDir"),报错与用户操作毫无关系
+    if (!targetDir) {
+      // 仅对内部拖拽(远程文件)提示;系统文件拖进来交给 FileBrowser 根层兜底提示
+      if (e.dataTransfer.types.includes(DND_MIME)) {
+        e.preventDefault(); e.stopPropagation()
+        showToast('请先进入一个具体目录(如 C:\\下载),再拖入下载', 'warn')
+      }
+      return
+    }
     if (e.dataTransfer.types.includes(DND_MIME)) {
       // 本机面板是封闭投放区:DND_MIME 拖拽一律在此终结。旧实现非本面板的拖拽
       // 只 return 不阻断冒泡,事件会冒到 FileBrowser 根层被当成"本地→远程上传"
@@ -271,7 +301,7 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
         <button onClick={openInExplorer} className="p-1 rounded hover:bg-bg-600 text-slate-400 hover:text-accent-400" title="用资源管理器打开当前目录"><FolderOpen size={12} /></button>
         <button onClick={() => fetchBrowse(browsePath)} className="p-1 rounded hover:bg-bg-600 text-slate-400 hover:text-accent-400" title="刷新"><RefreshCw size={12} /></button>
         <button
-          onClick={() => setSelectMode(m => !m)}
+          onClick={() => setSelectMode(m => { if (m) { setSelected(new Set()); selAnchorRef.current = -1 } return !m })}
           className={`p-1 rounded hover:bg-bg-600 ${selectMode ? 'text-accent-400 bg-accent-500/10' : 'text-slate-400 hover:text-accent-400'}`}
           title={selectMode ? '退出批量选择' : '批量选择(勾选后上传到远程当前目录)'}
         >
@@ -320,7 +350,7 @@ export function RemoteLocalPanel({ serverId, width, remoteDir, onPathChange, ref
                 onClick={() => setBrowsePath(browsePath ? joinPath(browsePath, e.name) : e.name)}
                 onDragOver={(ev) => { if (ev.dataTransfer.types.includes(DND_MIME)) { ev.preventDefault(); ev.stopPropagation(); ev.dataTransfer.dropEffect = 'copy'; dropDirRef.current = joinPath(browsePath, e.name); setDropDir(joinPath(browsePath, e.name)) } }}
                 onDragLeave={() => setDropDir(cur => (cur === joinPath(browsePath, e.name) ? null : cur))}
-                onDrop={(ev) => { ev.stopPropagation(); handleDrop(ev, joinPath(browsePath, e.name)) }}
+                onDrop={(ev) => { ev.stopPropagation(); handleDrop(ev, browsePath ? joinPath(browsePath, e.name) : e.name) }}
                 className={`flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-xs ${isTarget ? 'bg-accent-500/15 outline outline-1 outline-accent-500/50 text-accent-300' : 'hover:bg-bg-700 text-slate-400 hover:text-slate-200'}`}
                 title={e.name}
               >
