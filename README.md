@@ -100,8 +100,8 @@ ServerHub 定位为**运行在本机 / 内网的个人工具**，以下几点是
 ## 开发
 
 ```bash
-npm test              # 一键离线回归:10 个脚本(会话隔离/20 并发/传输自愈/切换稳定/进程不崩/完整历史重建/
-                      #   可靠性矩阵 51 断言/批次 J-K-L 三个专项 45 断言)
+npm test              # 一键离线回归:11 个脚本(会话隔离/20 并发/传输自愈/切换稳定/进程不崩/完整历史重建/
+                      #   可靠性矩阵 51 断言/批次 J-K-L 三个专项 45 断言/安全回归 47 断言)
 npm run typecheck     # tsc --noEmit
 npm run lint          # eslint(带 --max-warnings 上限,警告数只减不增)
 npm run build         # vite build → dist/(audit:ui 需要它)
