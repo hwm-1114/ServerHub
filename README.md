@@ -53,6 +53,12 @@
 
 ### 方式二：从源码运行
 
+## 安装
+
+**不想自己编译**：直接下载 Windows 安装包 —— [最新 Release](https://github.com/hwm-1114/ServerHub/releases/latest)（`ServerHub Setup <版本>.exe`，约 105MB）。安装包由 CI 自动构建，并经过"静默安装 → 启动 → 种数据 → 覆盖安装 → 数据保留 → 卸载"的自动化回归；**升级/卸载都不会删除你的服务器与命令数据**（数据在 `%APPDATA%/ServerHub`，与安装目录隔离）。
+
+**从源码运行**：
+
 环境要求：Node.js 18+；Windows 10+ / macOS / Linux（本地终端与桌面版打包在 Windows 上体验最佳）。
 
 ```bash
