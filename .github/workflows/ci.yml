@@ -63,6 +63,10 @@ jobs:
         run: npm ci
       - name: 离线回归套件
         run: npm test
+      # UI 回归加载的是真实前端产物(server 只在 dist/ 存在时服务静态文件,否则首页 404),
+      # 所以这一步必须先构建;Linux 的 static 任务虽然也构建,但产物不能跨任务直接用。
+      - name: 前端构建(UI 回归需要 dist/)
+        run: npm run build
       - name: 界面级回归(UI 审计)
         run: npm run audit:ui
       # 真机回归需要外部 SSH 服务器:配置仓库 secrets(SH_HOST/SH_USER/SH_PASS)后才会执行,

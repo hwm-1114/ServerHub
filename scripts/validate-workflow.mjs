@@ -36,6 +36,7 @@ const usedActions = []
 let runSteps = 0, ifSteps = 0
 for (const [id, job] of Object.entries(jobs)) {
   ok(!!job['runs-on'], `${id}: 指定了 runs-on`, job['runs-on'])
+  if (job.if) ifSteps++ // 条件也可能挂在任务级(release 只在 v* 标签上跑)
   const steps = job.steps || []
   ok(steps.length > 0, `${id}: 有步骤(${steps.length} 个)`)
   for (const s of steps) {
@@ -54,7 +55,7 @@ ok(missing.length === 0, 'run 里引用的 npm 脚本都存在于 package.json',
 const unpinned = usedActions.filter(u => !/@v\d/.test(u))
 ok(unpinned.length === 0, '所有 uses 都带主版本号', unpinned.length ? unpinned.join(', ') : usedActions.join('; '))
 
-ok(id => true, `条件步骤 ${ifSteps} 个`)
+ok(ifSteps >= 1, `条件步骤 ${ifSteps} 个(如 release 只在标签上跑)`)
 ok(jobs.release?.permissions?.contents === 'write', 'release 任务声明 contents: write(上传资产需要)')
 ok(jobs.release?.if?.includes("refs/tags/v"), 'release 任务只在标签上运行')
 ok((jobs.package?.needs === 'test'), 'package 依赖 test(回归不过不出包)')
@@ -69,6 +70,19 @@ ok(opens === closes && opens > 0, '${{ }} 表达式成对', `open=${opens} close
 const staticRuns = (jobs.static?.steps || []).map(s => s.run).filter(Boolean).join('\n')
 ok(/npm ci --ignore-scripts/.test(staticRuns), 'Linux 任务用 --ignore-scripts 跳过 node-pty 原生构建')
 ok(!/npm test|audit:/.test(staticRuns), 'Linux 任务不跑需要 node-pty 的脚本(已挪到 windows 任务)')
+
+// 步骤依赖顺序:界面/打包回归依赖真实产物,顺序错了会在 CI 上白跑一大轮才暴露
+const runList = (jobId) => (jobs[jobId]?.steps || []).map(s => s.run).filter(Boolean)
+const testRuns = runList('test')
+const idxBuild = testRuns.findIndex(r => /npm run build/.test(r))
+const idxUi = testRuns.findIndex(r => /npm run audit:ui/.test(r))
+ok(idxUi >= 0, 'test 任务跑 audit:ui')
+ok(idxBuild >= 0 && idxBuild < idxUi, 'test 任务先 npm run build 再 audit:ui(UI 回归加载 dist/ 产物)')
+const pkgRuns = runList('package')
+ok(pkgRuns.findIndex(r => /npm run app/.test(r)) < pkgRuns.findIndex(r => /audit:desktop|audit:installer/.test(r)),
+  'package 任务先出包再跑打包版/安装包回归')
+ok(/electron-builder --win nsis/.test(pkgRuns.join('\n')), 'package 任务生成 NSIS 安装包')
+ok(!runList('release').some(r => /audit:|npm test/.test(r)), 'release 任务只做版本校验与上传,不重复跑回归')
 
 console.log('\n' + '='.repeat(52))
 console.log(`工作流校验: ${pass} PASS / ${fail} FAIL`)

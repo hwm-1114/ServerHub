@@ -123,6 +123,13 @@ window.__t = {
 'READY'`
 
 async function main() {
+  // 界面回归跑的是**真实前端产物**:server/index.js 只在 dist/ 存在时服务静态文件,
+  // 缺产物时首页是 404,十几条断言会集体失败且原因难查,所以这里先明确报错。
+  if (!fs.existsSync(path.join(__dirname, '..', 'dist', 'index.html'))) {
+    console.error('缺少前端产物 dist/index.html,请先执行 npm run build 再跑 audit:ui')
+    app.exit(2)
+    return
+  }
   const { server } = await import('../server/index.js')
   if (!server.listening) await new Promise(r => server.once('listening', r))
   const win = new BrowserWindow({ show: false, width: 1400, height: 900, webPreferences: { contextIsolation: true, nodeIntegration: false } })
@@ -295,7 +302,8 @@ async function main() {
   console.log('='.repeat(52))
   try { server.close() } catch {}
   fs.rmSync(dataDir, { recursive: true, force: true })
-  app.exit(0)
+  // 断言失败必须以非 0 退出,否则 CI/脚本串跑会把"界面回归挂了"当成通过
+  app.exit(fail ? 1 : 0)
 }
 
 app.whenReady().then(() => main().catch(err => { console.error('UI 审计异常:', err); app.exit(2) }))
