@@ -1,5 +1,7 @@
 # ServerHub
 
+[![CI](https://github.com/hwm-1114/ServerHub/actions/workflows/ci.yml/badge.svg)](https://github.com/hwm-1114/ServerHub/actions/workflows/ci.yml)
+
 远程 Linux 服务器连接管理工具 —— SSH 终端、SFTP 文件管理、命令预设、本机终端、hdc 设备传输，提供 Web UI 与 Windows 桌面版。
 
 > 为"同时照看多台 Linux 服务器"的运维/开发场景设计：多标签多会话终端、拖拽式文件互传、常用命令一键执行，全部在同一个界面里完成。

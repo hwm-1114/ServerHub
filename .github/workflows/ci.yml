@@ -1,0 +1,159 @@
+name: CI
+
+# 触发:推 main、给 PR、打 v* 标签(标签会额外走"出安装包并发 Release")、也可手动跑
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支/标签只保留最新一次运行,旧的自动取消,省 CI 额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============ 1) 静态检查(Linux,快) ============
+  # 注意:node-pty 只提供 darwin/win32 预编译,没有 linux-x64。它在 Linux 上会退化成
+  # `node-gyp rebuild`(需要完整工具链、且慢),而 typecheck/lint/build 都不加载它,
+  # 所以这里用 --ignore-scripts 跳过原生构建。esbuild 的平台二进制来自
+  # optionalDependencies(@esbuild/linux-x64),不依赖安装脚本,vite build 照常可用。
+  # 需要真正跑后端脚本(会 import node-pty)的验证一律放在 windows 任务里。
+  static:
+    name: 静态检查(tsc / eslint / vite build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装依赖(跳过原生模块构建)
+        run: npm ci --ignore-scripts
+      - name: 类型检查
+        run: npm run typecheck
+      - name: 代码规范
+        run: npm run lint
+      - name: 前端构建
+        run: npm run build
+      - name: 上传前端产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  # ============ 2) 离线回归(Windows,目标平台) ============
+  # 五个旧脚本 + 完整历史 + 可靠性矩阵 51 条 + 批次 J/K/L 的三个离线回归(45 断言),
+  # 以及界面级回归 audit:ui(用 Electron 隐藏窗口真实驱动界面,假 ssh2,无需真服务器)。
+  test:
+    name: 离线回归(npm test + audit:ui)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装依赖
+        run: npm ci
+      - name: 离线回归套件
+        run: npm test
+      - name: 界面级回归(UI 审计)
+        run: npm run audit:ui
+      # 真机回归需要外部 SSH 服务器:配置仓库 secrets(SH_HOST/SH_USER/SH_PASS)后才会执行,
+      # 未配置自动跳过(audit:real 自身也会跳过)。外部机器不可用不应阻断 CI,故 continue-on-error。
+      - name: 真机回归(可选,需配置 SH_* secrets)
+        continue-on-error: true
+        env:
+          SH_HOST: ${{ secrets.SH_HOST }}
+          SH_USER: ${{ secrets.SH_USER }}
+          SH_PASS: ${{ secrets.SH_PASS }}
+        shell: bash
+        run: |
+          if [ -z "$SH_HOST" ]; then
+            echo "未配置 SH_HOST/SH_USER/SH_PASS,跳过真机回归"
+            exit 0
+          fi
+          npm run audit:real
+
+  # ============ 3) 打包 + 打包版 GUI/安装包验证(Windows) ============
+  package:
+    name: 出包 + 打包版/安装包验证
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: 安装依赖
+        run: npm ci
+      - name: 打包应用目录(release/win-unpacked)
+        run: npm run app
+      # 用 CDP 驱动打包后的真实 ServerHub.exe:内置后端/数据目录、界面建服务器、
+      # 合成 OS 拖放上传、拖到非投放区不导航走、单实例锁(无 SH_* secrets 时跳过真机相关断言)
+      - name: 打包版 GUI 回归(audit:desktop)
+        env:
+          SH_HOST: ${{ secrets.SH_HOST }}
+          SH_USER: ${{ secrets.SH_USER }}
+          SH_PASS: ${{ secrets.SH_PASS }}
+        run: npm run audit:desktop
+      - name: 生成 NSIS 安装包
+        run: npx electron-builder --win nsis
+      # 静默安装 → 启动已安装的应用 → 种数据 → 覆盖安装 → 数据仍在 → 静默卸载 → 数据保留
+      - name: 安装包回归(audit:installer)
+        run: npm run audit:installer
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            release/*.exe
+            release/*.blockmap
+          retention-days: 14
+
+  # ============ 4) 打标签时把安装包发到 Release ============
+  release:
+    name: 发布 Release(仅 v* 标签)
+    runs-on: windows-latest
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 下载安装包产物
+        uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: release
+      # 防"包名版本与标签不一致":安装包文件名/元数据都取自 package.json 的 version,
+      # 版本号忘了改就会出现 v1.3.2 标签里装着 1.2.2 的包,这里直接拦下。
+      - name: 校验标签与 package.json 版本一致
+        shell: pwsh
+        run: |
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+          if ("v$v" -ne $tag) {
+            Write-Error "标签 $tag 与 package.json 版本 v$v 不一致,请先同步版本号再打标签"
+            exit 1
+          }
+          Write-Host "版本一致: $tag"
+      - name: 创建或更新 Release 并上传安装包
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "ServerHub $tag" --generate-notes
+          }
+          gh release upload $tag release/*.exe release/*.blockmap --clobber
+          gh release view $tag --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
