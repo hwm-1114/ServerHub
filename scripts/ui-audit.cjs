@@ -308,6 +308,112 @@ async function main() {
     fs.rmSync(localDir, { recursive: true, force: true })
   }
 
+  console.log('\n【5】会话重命名(输入框必须自动聚焦;用户报"很容易重命名失败")')
+  {
+    // 展开侧栏服务器行(reload 后 expandedServers 重置为折叠;已展开则不动)
+    const expand = await js(`(() => {
+      const hasRow = [...document.querySelectorAll('div')].some(d => String(d.className || '').includes('group/ses') && /^会话 \\d+$/.test((d.textContent || '').trim()))
+      if (hasRow) return 'ALREADY'
+      const srvRow = [...document.querySelectorAll('div')].find(d => (d.textContent || '').includes('测试机') && String(d.className || '').includes('gap-2 px-2 py-2 rounded-lg') && d.querySelector('button'))
+      if (!srvRow) return 'NO_SRV'
+      srvRow.querySelector('button').click()
+      return 'EXPANDED'
+    })()`)
+    await wait(700)
+    // 打开侧栏会话行的 ⋮ 菜单 → 点"重命名"。
+    // 注意只匹配侧栏行(group/ses 类):主区 SessionTabs 的标签文本同样是"会话 N",
+    // 标签上的最后一个按钮是"关闭会话(X)",误点会直接删掉会话
+    const openMenu = await js(`(() => {
+      const rows = [...document.querySelectorAll('div')].filter(d => String(d.className || '').includes('group/ses') && /^会话 \\d+$/.test((d.textContent || '').trim()))
+      const row = rows.find(r => r.textContent.trim() === '会话 1')
+      if (!row) return 'NO_ROW'
+      const btns = [...row.querySelectorAll('button')]
+      btns[btns.length - 1].click()
+      return 'CLICKED'
+    })()`)
+    await wait(500)
+    ok(openMenu === 'CLICKED', '能打开会话行菜单', `展开=${expand} 打开=${openMenu}`)
+    const clickedRename = await js(`window.__t.clickExact('重命名', 'button')`)
+    await wait(400)
+    const dbg = await js(`({
+      menuBtns: window.__t.all('button').filter(b => window.__t.vis(b)).map(b => (b.textContent || '').trim()).filter(t => /重命名|关闭会话/.test(t)),
+      inputs: window.__t.all('input').filter(i => window.__t.vis(i)).map(i => i.value),
+      active: document.activeElement ? document.activeElement.tagName + ':' + (document.activeElement.value || '') : 'none',
+    })`)
+    console.log('       [调试] 菜单按钮=', JSON.stringify(dbg.menuBtns), ' 可见输入=', JSON.stringify(dbg.inputs), ' 焦点=', dbg.active)
+    // 核心回归点:输入框出现时必须已自动聚焦。修复前没有 autoFocus,焦点留在别处,
+    // 用户点完菜单直接打字毫无反应(甚至打进远端终端),表现为"重命名很容易失败"
+    const st = await js(`(() => {
+      const inputs = [...document.querySelectorAll('input')].filter(i => window.__t.vis(i) && i.value === '会话 1')
+      const inp = inputs[inputs.length - 1]
+      if (!inp) return { found: false }
+      return { found: true, focused: document.activeElement === inp }
+    })()`)
+    ok(st.found && st.focused, '重命名输入框出现时**自动聚焦**(本次修复点)', JSON.stringify(st))
+    // 不点击输入框,直接改值 + Enter 提交(等价于聚焦正常的用户行为)
+    const renamed = await js(`(() => {
+      const inputs = [...document.querySelectorAll('input')].filter(i => window.__t.vis(i) && i.value === '会话 1')
+      const inp = inputs[inputs.length - 1]
+      if (!inp) return 'NO_INPUT'
+      window.__t.setInput(inp, '改名会话')
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      return 'ENTERED'
+    })()`)
+    await wait(1200)
+    const body = await js(`window.__t.body()`)
+    ok(renamed === 'ENTERED' && body.includes('改名会话'), '回车提交后界面显示新名称', `提交=${renamed}`)
+    const sessionsApi = (await api(`/servers/${sid}/sessions`)).body
+    ok(Array.isArray(sessionsApi) && sessionsApi.some(x => x.name === '改名会话'), '后端会话记录持久化了新名称', JSON.stringify((sessionsApi || []).map(x => x.name)))
+  }
+
+  console.log('\n【6】文件批量勾选 → 批量删除(新增功能)')
+  {
+    await js(`window.__t.clickExact('文件')`)
+    await wait(2000)
+    // 等远程列表渲染出 upload-me.txt(【4】上传过),再确保勾选模式开启
+    // (【4】结束时勾选模式可能仍是开启状态,开关标题已变"退出批量勾选")
+    let remoteRows = 0
+    for (let i = 0; i < 20 && remoteRows === 0; i++) {
+      remoteRows = await js(`[...document.querySelectorAll('tr')].filter(tr => /upload-me\\.txt/.test(tr.textContent)).length`)
+      if (remoteRows === 0) await wait(500)
+    }
+    const selRemote = await js(`(() => {
+      const b = window.__t.all('button[title]').find(x => /批量勾选远程文件/.test(x.getAttribute('title') || ''))
+      if (!b) return 'ALREADY'
+      b.click(); return 'CLICKED'
+    })()`)
+    await wait(700)
+    const picked = await js(`(() => {
+      const rows = [...document.querySelectorAll('tr')].filter(tr => /upload-me\\.txt/.test(tr.textContent))
+      rows.forEach(tr => tr.click())
+      return rows.length
+    })()`)
+    await wait(500)
+    const btnTxt = await js(`(window.__t.byText('删除选中').filter(e => window.__t.vis(e))[0]?.textContent || '').trim()`)
+    const clicked = await js(`window.__t.clickText('删除选中')`)
+    await wait(500)
+    ok((selRemote === 'CLICKED' || selRemote === 'ALREADY') && picked > 0 && clicked === 'CLICKED', '勾选远程文件后出现「删除选中」并可点击',
+      `模式=${selRemote} 勾选=${picked} 按钮="${btnTxt}" 点击=${clicked}`)
+    // 危险确认:输入"删除"并点确认按钮
+    const typed = await js(`(() => {
+      const inputs = [...document.querySelectorAll('input')].filter(i => window.__t.vis(i))
+      const inp = inputs[inputs.length - 1]
+      if (!inp) return 'NO_INPUT'
+      window.__t.setInput(inp, '删除')
+      return 'OK'
+    })()`)
+    const confirmed = await js(`window.__t.clickText('删除 1 项', 'button')`)
+    await wait(3000)
+    const remoteAfter = await (await fetch(`${API}/servers/${sid}/files?path=${encodeURIComponent('/home/u')}`)).json()
+    const gone = !(remoteAfter.entries || []).some(e => e.filename === 'upload-me.txt')
+    ok(typed === 'OK' && confirmed === 'CLICKED' && gone, '输入"删除"确认后文件被删除',
+      `输入=${typed} 确认=${confirmed} 远端剩余=${JSON.stringify((remoteAfter.entries || []).map(e => e.filename))}`)
+    // 完成后勾选集合清空:「删除选中」按钮应消失
+    await wait(800)
+    const btnLeft = await js(`window.__t.byText('删除选中').filter(e => window.__t.vis(e)).length`)
+    ok(btnLeft === 0, '删除完成后勾选集合清空(按钮消失)', `残留按钮=${btnLeft}`)
+  }
+
   console.log('\n【页面 console 错误】')
   if (errors.length) errors.slice(0, 8).forEach(e => console.log('   ⚠', e.slice(0, 180)))
   else console.log('   (无)')

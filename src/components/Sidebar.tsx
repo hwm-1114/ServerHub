@@ -353,8 +353,10 @@ export function Sidebar({
                             <span className="flex-1 min-w-0">
                               {renaming === s.id ? (
                                 <input
+                                  autoFocus
                                   value={renameDraft}
                                   onChange={e => setRenameDraft(e.target.value)}
+                                  onFocus={e => e.target.select()}
                                   onBlur={() => commitRename(s)}
                                   onKeyDown={e => {
                                     if (e.key === 'Enter') commitRename(s)

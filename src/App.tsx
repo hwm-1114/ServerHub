@@ -264,13 +264,20 @@ function App() {
   }
 
   const handleRenameSession = async (s: Session, name: string) => {
-    const res = await fetch(`/api/servers/${s.serverId}/sessions/${s.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    })
-    const updated = await res.json()
-    setSessions(prev => prev.map(x => (x.id === s.id ? updated : x)))
+    try {
+      const res = await fetch(`/api/servers/${s.serverId}/sessions/${s.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      const data = await res.json().catch(() => ({}))
+      // 旧实现不检查 res.ok:失败时 {error} 响应体会整个替换掉 state 里的会话对象,
+      // 会话名称/标签随之损坏,看起来像"重命名失败且会话坏了"
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setSessions(prev => prev.map(x => (x.id === s.id ? { ...x, name } : x)))
+    } catch (err) {
+      alert(`重命名会话失败: ${err instanceof Error ? err.message : '未知错误'}`)
+    }
   }
 
   const handleDuplicateSession = async (s: Session) => {

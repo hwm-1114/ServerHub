@@ -68,6 +68,9 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
   const [localPanelRefresh, setLocalPanelRefresh] = useState(0)
   const [selRemote, setSelRemote] = useState<Set<string>>(new Set())
   const [downloading, setDownloading] = useState(false)
+  // 批量删除勾选的远程文件/目录
+  const [batchDeleting, setBatchDeleting] = useState(false)
+  const [showBatchDelete, setShowBatchDelete] = useState(false)
   // 远程目录批量勾选模式:由工具栏开关控制,不再随"打开本机面板"自动出现
   const [selectMode, setSelectMode] = useState(false)
   // Shift 连续选择锚点:记录最后一次(非 shift)点击的列表索引
@@ -120,6 +123,36 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
       return n
     })
     selAnchorRef.current = idx
+  }
+
+  // 批量删除勾选的远程文件/目录(串行,聚合每项失败原因;目录为递归删除)
+  const doBatchDelete = async () => {
+    const files = Array.from(selRemote)
+    if (files.length === 0) return
+    setBatchDeleting(true)
+    let ok = 0
+    const fails: string[] = []
+    for (const p of files) {
+      const name = p.split('/').filter(Boolean).pop() || p
+      try {
+        const res = await fetch(`/api/servers/${serverId}/files?path=${encodeURIComponent(p)}`, { method: 'DELETE' })
+        const d = await res.json().catch(() => ({}))
+        if (!res.ok || d.error) throw new Error(d.error || `HTTP ${res.status}`)
+        ok++
+      } catch (err) {
+        fails.push(`${name}: ${err instanceof Error ? err.message : '未知错误'}`)
+      }
+    }
+    setBatchDeleting(false)
+    setShowBatchDelete(false)
+    setSelRemote(new Set())
+    selAnchorRef.current = -1
+    if (fails.length === 0) setNotice(`已删除 ${ok}/${files.length} 项`)
+    else {
+      const head = fails.slice(0, 2).join('；')
+      setNotice(`已删除 ${ok}/${files.length} 项,失败: ${head}${fails.length > 2 ? ` 等 ${fails.length} 项` : ''}`)
+    }
+    loadDir(currentPathRef.current)
   }
 
   // 文件行点击:shift 时按锚点做连续区间选择;否则普通切换
@@ -796,6 +829,18 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
             </button>
           )}
 
+          {/* 批量删除勾选的远程文件/目录 */}
+          {selRemote.size > 0 && (
+            <button
+              onClick={() => setShowBatchDelete(true)}
+              disabled={batchDeleting}
+              className="px-2 py-1 rounded-md text-[11px] font-medium bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 disabled:opacity-40"
+              title={`删除选中的 ${selRemote.size} 个文件/目录(目录递归删除)`}
+            >
+              {batchDeleting ? <Loader2 size={11} className="animate-spin inline" /> : <Trash2 size={11} className="inline" />} 删除选中({selRemote.size})
+            </button>
+          )}
+
           {/* 收藏当前路径 */}
           <button
             onClick={addBookmark}
@@ -1173,6 +1218,17 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
         confirmText={deleting ? '删除中...' : '永久删除'}
         onConfirm={doDelete}
         onCancel={() => { setDeleteTarget(null); setShowDangerConfirm(false) }}
+      />
+      {/* 批量删除勾选项:输入"删除"二次确认(含目录时为递归删除) */}
+      <ConfirmDialog
+        open={showBatchDelete}
+        title="批量删除"
+        danger
+        typeText="删除"
+        message={`即将删除选中的 ${selRemote.size} 个文件/目录(目录将递归删除其全部内容)。\n\n此操作不可恢复!`}
+        confirmText={batchDeleting ? '删除中...' : `删除 ${selRemote.size} 项`}
+        onConfirm={doBatchDelete}
+        onCancel={() => setShowBatchDelete(false)}
       />
 
       {/* 新建目录 / 重命名 输入弹窗 */}
