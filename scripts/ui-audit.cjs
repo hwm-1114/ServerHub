@@ -333,7 +333,7 @@ async function main() {
     })()`)
     await wait(500)
     ok(openMenu === 'CLICKED', '能打开会话行菜单', `展开=${expand} 打开=${openMenu}`)
-    const clickedRename = await js(`window.__t.clickExact('重命名', 'button')`)
+    await js(`window.__t.clickExact('重命名', 'button')`)
     await wait(400)
     const dbg = await js(`({
       menuBtns: window.__t.all('button').filter(b => window.__t.vis(b)).map(b => (b.textContent || '').trim()).filter(t => /重命名|关闭会话/.test(t)),
