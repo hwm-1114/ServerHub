@@ -1,4 +1,5 @@
 // 离线回归:文件名编码 / 符号链接删除 / 新建目录语义 / 错误信息中文化 / 命令集导出导入与排序
+// / 上传看护超时 / 服务器私钥字段读写 / json body 上限(在线编辑 400KB)
 // 全部用假 ssh2 + 内存文件系统驱动真实后端路由,不需要真服务器,可并入 npm test。
 // 运行: node scripts/verify-fixes.mjs
 import { createRequire } from 'module'
@@ -162,6 +163,7 @@ const list = (p) => fetch(`${BASE}/api/servers/srv-t/files?path=${enc(p)}`).then
 const dl = (p) => fetch(`${BASE}/api/servers/srv-t/files/download?path=${enc(p)}`)
 const del = (p) => fetch(`${BASE}/api/servers/srv-t/files?path=${enc(p)}`, { method: 'DELETE' }).then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }))
 const jpost = (p, b) => fetch(BASE + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) }).then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }))
+const jput = (p, b) => fetch(BASE + p, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) }).then(async r => ({ status: r.status, body: await r.json().catch(() => ({})) }))
 
 let pass = 0, fail = 0
 const ok = (cond, label, extra = '') => {
@@ -327,6 +329,35 @@ console.log('\n【6】上传中途"半开连接":看护超时必须中止并清�
   ok(ws6 && ws6.destroyed === true, '超时后写流被销毁(不泄漏 SFTP 通道)',
     `destroyed=${ws6 && ws6.destroyed}`)
   ok(!nodes.has('/data/stall.bin'), '超时后远端无半成品残留', `远端文件=${nodes.has('/data/stall.bin') ? '残留' : '已清理/未创建'}`)
+}
+
+console.log('\n【7】服务器私钥字段:POST 落盘 / PUT 覆盖 / PUT 空串删除(与前端 ServerModal 语义一致)')
+{
+  const created = await jpost('/api/servers', { name: 'key-srv', host: '10.0.0.1', username: 'u', privateKey: 'KEY-1' })
+  ok(created.status === 201 && created.body.privateKey === 'KEY-1', 'POST 带 privateKey → 201 且响应含私钥', `HTTP ${created.status} ${JSON.stringify(created.body).slice(0, 100)}`)
+
+  const listed = await (await fetch(`${BASE}/api/servers`)).json()
+  const found = listed.find(s => s.id === created.body.id)
+  ok(found && found.privateKey === 'KEY-1', 'GET /api/servers 返回里含 privateKey(连接读侧认证要用)', `找到=${!!found} key=${found && found.privateKey}`)
+
+  const noKey = await jpost('/api/servers', { name: 'pwd-srv', host: '10.0.0.2', username: 'u', password: 'p', privateKey: '' })
+  ok(noKey.status === 201 && !('privateKey' in noKey.body), 'POST 空串私钥不落盘(视为密码认证)', `HTTP ${noKey.status}`)
+
+  const upd = await jput(`/api/servers/${created.body.id}`, { privateKey: 'KEY-2' })
+  ok(upd.status === 200 && upd.body.privateKey === 'KEY-2', 'PUT 覆盖 privateKey 生效', `HTTP ${upd.status}`)
+
+  const cleared = await jput(`/api/servers/${created.body.id}`, { privateKey: '' })
+  ok(cleared.status === 200 && !('privateKey' in cleared.body), 'PUT 传空串 → 删除私钥,回到密码认证', `HTTP ${cleared.status} 字段=${Object.keys(cleared.body).join(',')}`)
+}
+
+console.log('\n【8】json body 上限 1mb:在线编辑 400KB 不再被默认 100kb 上限 413 截杀')
+{
+  const big = 'A'.repeat(400 * 1024)
+  const r = await jput('/api/servers/srv-t/files/content', { path: '/data/big-edit.txt', content: big })
+  ok(r.status === 200, 'PUT /files/content 提交约 400KB 成功(修复前 express.json 默认 100kb → 413 HTML 错误页)', `HTTP ${r.status} ${JSON.stringify(r.body).slice(0, 80)}`)
+  ok(nodes.has('/data/big-edit.txt') && nodes.get('/data/big-edit.txt').content.length === 400 * 1024,
+    '400KB 内容经路由层 512KB 校验后完整落盘',
+    `远端长度=${nodes.has('/data/big-edit.txt') ? nodes.get('/data/big-edit.txt').content.length : '缺失'}`)
 }
 
 console.log('\n' + '='.repeat(52))

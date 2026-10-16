@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -40,7 +40,8 @@ function encodeInputBase64(text: string): string {
 // 镜像 Terminal.tsx 的结构,但连接 /ws/local?session=<id>&cwd=<dir>,无服务器连接前提。
 // 终端实例常驻挂载(由 App 控制显隐),WS 断开有限次重连;
 // 在 WS 就绪时按自身会话 id 注册进 TerminalBridge,供本地命令集注入/聚焦/导出。
-export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
+// memo 化:与 Terminal 一致,常驻实例在 App 5s 状态轮询下不再跟着重渲染
+export const LocalTerminal = memo(function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<XTerm | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -418,4 +419,4 @@ export function LocalTerminal({ id, name, cwd, active, onActivity }: Props) {
       )}
     </div>
   )
-}
+})

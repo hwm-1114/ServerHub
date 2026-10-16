@@ -78,6 +78,21 @@
 
 **桌面版升级数据保留（用户强要求，已实测）**：所有运行数据写在 `%APPDATA%/ServerHub`（Electron userData，`main.cjs` 设 `SERVERHUB_DATA_DIR`），与安装目录完全隔离；NSIS 覆盖安装只替换安装目录文件。已实测"安装→种入服务器/命令数据→覆盖重装→数据完整保留"，且 `deleteAppDataOnUninstall: false` 保证卸载也不删数据。
 
+**缺陷修复批次 O（2026-10-16，v1.3.5；全量实现审查后的 P0+P1 修复；离线/真机/打包版全绿）**：对全仓库做了一次四模块并行实现审查（后端 / 前端核心 / 终端与传输 / 桌面壳与工程化），修掉 1 项 P0 + 8 项 P1，P2 形成 backlog 附后。
+
+- **O1（P0）私钥认证服务器依然建不出来——前后端契约断裂**：批次 M3 在 `ServerModal` 加了私钥字段并随请求提交，但后端 `POST/PUT /api/servers` 只解构 `{name,host,port,username,password}`，**私钥被静默丢弃**（读侧 `getServerConfig`/`openTerminalConn` 一直支持 privateKey）；前端 `handleSaveServer` 又不查响应，ui-audit 落盘断言只查 host/port/name，回归一直绿。修复：POST 非空才落盘、PUT 非空覆盖 / 显式空串 `delete` 回密码认证；`handleSaveServer` 改 apiFetch + 用后端返回对象更新 state + 失败 alert（`handleDisconnect`/`handleDeleteServer`/`handleDeleteSession` 一并改为先校验响应再改本地状态——旧实现删会话失败本地照删、刷新"复活"）；ui-audit 补私钥落盘断言（23→24；HELPERS.setInput 顺带支持 textarea——私钥字段是 textarea 不是 input，旧写法 Illegal invocation）。verify-fixes 新增 5 条私钥断言。
+- **O2（P1）`ensureFileClient` 并发竞态**：existing 处于 connecting 时并发调用各 `new Client`，第二个覆盖 Map 条目，第一个的 ready/close 回调误标状态/误删条目、第一个 client 永久泄漏一条 SSH 连接。改为条目挂 ready Promise（connecting 时 `await existing.ready` 同一次连接），所有事件回调先校验 `fileConnections.get(serverId) === entry` 再改/删；顺带修掉"connecting 期间 close/end 不 settle 永久挂起"（现在 reject 中文原因）。
+- **O3（P1）`express.json()` 默认 100KB 上限**：把"在线编辑 512KB"（路由层才限 512KB）与超 100KB 的命令集导入 413 截杀（且返回 HTML 错误页）——改 `express.json({limit:'1mb'})`，上传绕过逻辑不动。verify-fixes 新增 2 条 400KB 编辑断言（修复前 413）。
+- **O4（P1）下载路由中止不清流、无看护**：浏览器取消下载没有 `res 'close'` 清理，SFTP 读流永久残留占通道；上传/local-to-remote/remote-to-local 三条路径都有 idle 60s/total 30min 看护唯独下载没有。补 finished 标志 + close 清理 + 同阈值看护（超时 destroy 流+响应，头已发不再回 JSON）。**四条传输路径现在同一看护标准**。
+- **O5（P1）`loadSessions` 抢活跃会话**：任何 `loadSessions(A)` 完成时活跃会话若属服务器 B 会被强切到 A 首个会话（在 B 终端干活时点 A 的连接按钮焦点被偷）。改为仅 `prev===null` 或 prev 属本服务器且已不存在时才改；加按服务器分键的请求序号丢弃过期响应；自动创建失败不再把 `{error}` 当会话塞状态。
+- **O6（P1）5s 状态轮询整树常驻重渲染**：`fetchStatuses` 无条件 `setStatuses(新对象)` → App 每 5s 重渲染 → 全部常驻 Terminal 白跑。改浅比较（无变化返回 prev）+ 响应形状校验；`handleConnect`/`handleDisconnect`/`handleOpenFilesAtSession` useCallback 化，`Terminal`/`LocalTerminal` 改 memo 导出（props 全稳定后轮询不再重渲染终端）。**Terminal 的 WS effect 依赖红线未动**。
+- **O7（P1）大文件"流式另存"用户激活问题**：`showSaveFilePicker` 要求瞬时用户激活，旧实现在 `await fetch` 拿响应头后才调它——批量第 2 个起激活耗尽、drop 事件不在激活事件列表、慢响应超激活有效期，三条路径都抛 SecurityError 且不匹配 UNSUPPORTED 回退分支被计为失败。改：`startDownload` 增 `knownSize` 入参，>阈值时**手势同步阶段先取 save handle 再 fetch**（FileBrowser 行内下载传 `entry.size`；拖拽/预览两处拿不到大小走旧路径）；SecurityError 纳入回退分支回退 Blob；AbortError"已取消"语义不变。
+- **O8（P1）打包卫生**：react/react-dom/lucide-react/@xterm×2 五个纯前端包从 dependencies 移 devDependencies（已由 Vite 打进 dist，**app.asar 14MB→5.0MB**）；build.files 排除 node-pty 的 darwin-*/win32-arm64 prebuilds 与 src/third_party（与 asarUnpack 叠加生效，unpacked 只剩 win32-x64 共 4MB）。
+- **O9（P1）Google Fonts 外网样式表渲染阻塞**：内网/离线启动首屏白等 fonts.googleapis 超时（与"本地/内网工具"定位冲突）——改 `@fontsource/inter` + `@fontsource/jetbrains-mono` 本地化（字重与原链接一致，dist/assets 83 个字体文件），删除 index.html 外链。
+- **顺手**：tsconfig 删 `@/*` paths 死配置（Vite 未配同名 alias，易误导新人）；`main.cjs` 18-20 注释修正为真实行为（app:dev 的后端是 concurrently 兄弟进程读不到主进程 env，写仓库 ./data 属预期）；版本 1.3.4→1.3.5。
+- **验证**：tsc 0 错误 / lint 0 error·80 warning（上限 91，只减不增）/ build ✅ / npm test 11 脚本全绿（verify-fixes 26→33）/ audit:ui **24 PASS** / **audit:real 27 PASS**（新归档阿里云验证机 **123.57.249.101**，Ubuntu 24.04，2C/894MB，maxsessions=10；凭据归档 `.verify/sh-real.env`【gitignored，勿提交】，`set -a; . .verify/sh-real.env; set +a` 后再跑 audit:real / audit:desktop）/ **audit:desktop 15 PASS**（裁剪后打包版连真机）。
+- **P2 backlog（已识别未修，供后续批次）**：doCreateShell 通道耗尽无限递归重试（应限次数）；readFileContent 按块解码中文出 U+FFFD（终端已修流式解码，预览漏修）；本地终端 WS 无会话上限 + 同 id 顶 pty 杀错进程；browseDirectory 串行 stat 大目录慢；runHostCommand 输出无上限 + kill 后可能永不 settle；默认绑 0.0.0.0（建议 SERVERHUB_HOST 默认 127.0.0.1）；WSS 未设 maxPayload；main.tsx 令牌头子串匹配应改 origin 比对；终端历史三份内存无上限；下载无并发上限（上传限 2）；FileBrowser 大目录无虚拟化 + key={i}；菜单/弹窗无 Escape 键处理；查看完整历史前 `blur()` 作用于普通 div 无效（打字穿遮罩进 shell）；窗口尺寸/菜单/关窗杀全部会话无确认；CI dist 产物无人消费 + package 不 needs static；依赖补丁积压（Electron 43.4.1→43.7.11 等）；@xterm/headless 6 与 xterm 5.5 大版本错位；App.tsx 上帝组件重构（useServerSessions/useLocalSessions、本地标签条复用 SessionTabs）；CommandPanel 删除类操作不查响应；retryAfterReconnect 死代码（已无调用点，会杀全池会话，留着有误用风险）。
+
 ## 项目概述
 
 ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌面壳）：SSH 终端（xterm.js + WebSocket）、SFTP 文件浏览/双向传输、命令预设、本机 PowerShell 终端、hdc 设备文件传输。单体架构：Express + ws 后端（端口 3120）+ Vite/React 前端（端口 5173）。全部 UI 文案与代码注释为**中文**，保持中文。
@@ -106,10 +121,10 @@ ServerHub——远程 Linux 服务器连接管理工具（Web UI + Electron 桌�
 | `node scripts/verify-sessions.mjs` / `verify-20-sessions.mjs` | 离线断言：会话隔离 / 20 会话并发全开 |
 | `node scripts/stress-transfer-stability.mjs` / `stress-switch-stability.mjs` / `stress-process-reliability.mjs` | 离线压力：传输自愈 / 切换稳定 / 进程不崩 |
 | `npm run typecheck` | `tsc --noEmit`（只覆盖 `src/`，`server/`+`scripts/`+`electron/` 的未定义标识符由 lint 的 `no-undef` 兜底） |
-| `npm run lint` | `eslint src server scripts electron --max-warnings 91`（当前 0 error / 91 warning；带上限是为了"警告只减不增"，加了新警告要顺手修掉或调这个数） |
-| `npm test` | 一键串跑 11 个离线脚本：五个旧脚本 + `verify-fullhistory` + 可靠性矩阵 51 条 + 批次 J/K/L 的三个离线回归（verify-fixes 26 / verify-drag-paths 9 / verify-ansi-html 10）+ **安全回归 `verify-security.mjs` 47 条**（令牌 401 / WS 1008 / CORS 白名单 / 未设令牌行为不变） |
+| `npm run lint` | `eslint src server scripts electron --max-warnings 91`（批次 O 后 0 error / 80 warning；带上限是为了"警告只减不增"，加了新警告要顺手修掉或调这个数） |
+| `npm test` | 一键串跑 11 个离线脚本：五个旧脚本 + `verify-fullhistory` + 可靠性矩阵 51 条 + 批次 J/K/L 的三个离线回归（verify-fixes 33【批次 O 新增私钥 5 条+400KB 编辑 2 条】 / verify-drag-paths 9 / verify-ansi-html 10）+ **安全回归 `verify-security.mjs` 47 条**（令牌 401 / WS 1008 / CORS 白名单 / 未设令牌行为不变） |
 | `npm run audit:real` | **真机回归**：`scripts/real-audit.mjs`，27 断言；凭据走 `SH_HOST/SH_USER/SH_PASS` 环境变量，未设置自动跳过 |
-| `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），16 断言：新建服务器/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载；**需先 `npm run build`**（加载的是真实前端产物，缺 `dist/` 会明确报错退出 2），断言失败退出码 1 |
+| `npm run audit:ui` | **UI 级回归**：`scripts/ui-audit.cjs`（Electron 隐藏窗口真实驱动界面，假 ssh2），24 断言：新建服务器（含私钥落盘）/连接断开入口/会话在启动·刷新·断开·重连四个时机的存续/本机↔远端批量上传下载/重命名/批量删除；**需先 `npm run build`**（加载的是真实前端产物，缺 `dist/` 会明确报错退出 2），断言失败退出码 1 |
 | `npm run audit:desktop` | **打包版 GUI 回归**：`scripts/desktop-audit.mjs`（对 `release/win-unpacked/ServerHub.exe` 用 CDP 驱动 + `Input.dispatchDragEvent` 合成真实拖放），15 断言：内置后端/数据目录、界面建服务器并连真机、**拖文件到远程列表=上传**、**拖到侧栏/终端区不导航走**、断开后会话仍在、单实例锁 |
 | `npm run audit:installer` | **安装包回归**：`scripts/installer-audit.mjs`（NSIS 静默安装 → 启动 → 种数据 → **覆盖安装** → 数据仍在 → 静默卸载 → 数据保留），18 断言；需先 `npm run dist:nsis` |
 | `npm run validate:workflow` | 离线校验 `.github/workflows/ci.yml`（47 断言：任务/触发/secrets 用法/步骤顺序/出包参数/发版细节/版本一致性检查等），改工作流后跑一次；**CI 的 static 任务也会跑它**（改坏工作流先在本地拦下） |

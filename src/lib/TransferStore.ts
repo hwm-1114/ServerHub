@@ -200,10 +200,17 @@ export function startUpload(serverId: string, dir: string, file: File): string {
 // 旧实现把整个文件缓存在 chunks 数组里再建 Blob,GB 级下载会把标签页内存撑爆。
 const STREAM_SAVE_THRESHOLD = 64 * 1024 * 1024
 
-async function saveViaPicker(res: Response, fileName: string, total: number | null, onProgress: (n: number) => void): Promise<void> {
+// 弹"另存为"对话框拿文件句柄。注意:showSaveFilePicker 要求【瞬时用户激活】,
+// 必须在点击/手势的同步调用链里调用;await fetch 之后再调,批量下载第 2 个文件起、
+// 拖拽 drop、慢服务器响应三种路径都会抛 SecurityError。
+async function acquireSaveHandle(fileName: string): Promise<any> {
   const picker = (window as any).showSaveFilePicker
   if (typeof picker !== 'function') throw new Error('UNSUPPORTED')
-  const handle = await picker.call(window, { suggestedName: fileName })
+  return picker.call(window, { suggestedName: fileName })
+}
+
+// 在已拿到的句柄上流式落盘:边收边写、内存恒定
+async function streamToHandle(handle: any, res: Response, total: number | null, onProgress: (n: number) => void): Promise<void> {
   const writable = await handle.createWritable()
   const reader = res.body!.getReader()
   let received = 0
@@ -222,7 +229,15 @@ async function saveViaPicker(res: Response, fileName: string, total: number | nu
   }
 }
 
-export async function startDownload(serverId: string, path: string): Promise<string> {
+async function saveViaPicker(res: Response, fileName: string, total: number | null, onProgress: (n: number) => void): Promise<void> {
+  const handle = await acquireSaveHandle(fileName)
+  await streamToHandle(handle, res, total, onProgress)
+}
+
+// knownSize:调用方事先知道的文件大小(如文件列表 entry.size)。大于流式阈值时,
+// 趁用户手势的同步阶段先把"另存为"句柄拿到,再发 fetch —— 这是唯一不依赖
+// "fetch 之后用户激活仍有效"的大文件流式路径。
+export async function startDownload(serverId: string, path: string, knownSize?: number): Promise<string> {
   // 这里拿到的是【原始远端路径】(调用方直接传 entry.filename 拼出来的路径,不是 URL 编码串)。
   // 绝不能再 decodeURIComponent:文件名里含 % 时它要么抛 URIError(整个下载毫无反应、无提示),
   // 要么把 a%20b 这种合法文件名解成 a b(存成错误的文件名)。
@@ -232,6 +247,24 @@ export async function startDownload(serverId: string, path: string): Promise<str
 
   const ctrl = new AbortController()
   controllers.set(id, { abort: () => ctrl.abort() })
+
+  // 大文件:手势同步阶段先拿保存句柄(此时用户激活必然有效),再发请求
+  let preHandle: any = null
+  if (typeof knownSize === 'number' && knownSize > STREAM_SAVE_THRESHOLD) {
+    try {
+      preHandle = await acquireSaveHandle(fileName)
+    } catch (err) {
+      // 用户取消另存为对话框:按"已取消"处理,不是失败
+      if (err instanceof Error && (err.name === 'AbortError' || /abort/i.test(err.message))) {
+        controllers.delete(id)
+        update(id, { status: 'cancelled' })
+        return id
+      }
+      // 不支持该 API(UNSUPPORTED)/激活已失效(SecurityError):不阻塞下载,
+      // 继续走普通路径,拿到响应头后按大小再分流(届时仍失败会回退 Blob)
+      preHandle = null
+    }
+  }
 
   try {
     const res = await fetch(`/api/servers/${serverId}/files/download?path=${encodeURIComponent(path)}`, { signal: ctrl.signal })
@@ -244,7 +277,26 @@ export async function startDownload(serverId: string, path: string): Promise<str
     }
     const total = Number(res.headers.get('Content-Length') || 0) || null
 
-    // 大文件优先流式另存(取消键由 AbortController 中断 read,-picker 流会 abort)。
+    // 手势阶段已拿到句柄:直接复用流式落盘(取消键由 AbortController 中断 read,写流随之 abort)
+    if (preHandle) {
+      try {
+        await streamToHandle(preHandle, res, total, (p) => update(id, { progress: p }))
+        controllers.delete(id)
+        update(id, { status: 'done', progress: 100 })
+        return id
+      } catch (err) {
+        // 传输条上点取消(AbortError):按"已取消"处理
+        if (err instanceof Error && (err.name === 'AbortError' || /abort/i.test(err.message))) {
+          controllers.delete(id)
+          update(id, { status: 'cancelled' })
+          return id
+        }
+        // 写盘/读流中途出错:响应流已部分消费,无有意义回退,计为失败
+        throw err
+      }
+    }
+
+    // 事先不知道大小(fetch 后才有 Content-Length)才走到这里弹另存为。
     // 注意:这一步必须在【取出 reader 之前】分流 —— ReadableStream 一旦 getReader()
     // 就被锁定,再 getReader() 会抛 "Invalid state: ReadableStream is locked",
     // 导致 >64MB 的下载在用户选完另存为路径后必然失败(且不会回退 Blob 方案)。
@@ -261,11 +313,10 @@ export async function startDownload(serverId: string, path: string): Promise<str
           update(id, { status: 'cancelled' })
           return id
         }
-        if (err instanceof Error && err.message === 'UNSUPPORTED') {
-          // 浏览器不支持 File System Access API:落到下方 Blob 路径(响应流未被消费)
-        } else {
-          throw err
-        }
+        // 浏览器不支持(UNSUPPORTED)或用户激活已失效(SecurityError,慢响应/拖拽路径):
+        // 响应流尚未消费,落到下方 Blob 路径,不再计为失败
+        const canFallbackBlob = err instanceof Error && (err.message === 'UNSUPPORTED' || err.name === 'SecurityError')
+        if (!canFallbackBlob) throw err
       }
     }
 

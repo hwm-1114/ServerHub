@@ -1088,7 +1088,9 @@ export function FileBrowser({ serverId, isConnected, onConnect, onOpenSessionInD
                                 const full = currentPath.endsWith('/')
                                   ? currentPath + entry.filename
                                   : currentPath + '/' + entry.filename
-                                startDownload(serverId, full)
+                                // 传入已知大小:>64MB 时 startDownload 趁点击手势同步阶段
+                                // 先弹"另存为"拿句柄,避免 fetch 后激活失效无法流式落盘
+                                startDownload(serverId, full, entry.size)
                               }}
                               className="p-1.5 rounded hover:bg-bg-600 text-slate-400 hover:text-accent-400"
                               title="下载"

@@ -16,7 +16,9 @@ const DEV_URL = process.env.ELECTRON_START_URL || ''
 const isDev = !!DEV_URL
 
 // 打包后 asar 只读,数据必须写到可写目录(Electron userData,如 %APPDATA%/ServerHub)。
-// 开发模式后端(nodemon)会读到该 env,同样写到这里,保持一致。
+// 注意该 env 只对**本进程**生效:生产模式的内置后端由本进程 import(见 whenReady),
+// 能读到它;开发模式(npm run app:dev)的后端是 concurrently 拉起的 nodemon 兄弟进程,
+// 读不到这里的 env,仍写仓库 ./data —— 桌面壳数据与开发数据互不影响,属预期行为。
 process.env.SERVERHUB_DATA_DIR = app.getPath('userData')
 
 let win = null

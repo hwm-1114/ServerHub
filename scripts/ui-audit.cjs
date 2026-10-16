@@ -96,7 +96,9 @@ window.__t = {
     els[0].click(); return 'CLICKED'
   },
   setInput: (el, v) => {
-    const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+    // textarea 的 value 描述符在 HTMLTextAreaElement.prototype 上,拿 input 的 setter 去打会 "Illegal invocation"
+    const proto = el instanceof window.HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+    const d = Object.getOwnPropertyDescriptor(proto, 'value')
     d.set.call(el, v); el.dispatchEvent(new Event('input', { bubbles: true }))
   },
   fillLabel: (labelText, value) => {
@@ -174,7 +176,9 @@ async function main() {
     await wait(300)
     const t2 = await js(`[...document.querySelectorAll('h2')].map(h => h.textContent.trim())`)
     ok(t2.some(t => /添加服务器/.test(t)), '必填为空时提交被应用拦下(弹窗保持打开)')
-    for (const [l, v] of [['名称', '测试机'], ['IP 地址', '10.0.0.9'], ['端口', '2222'], ['用户名', 'root'], ['密码', 'pw123']]) {
+    // 假 ssh2 不校验密钥内容,任意字符串即可;但必须真的填进表单,才能验证 privateKey 随记录落盘
+    const FAKE_KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\\nFAKE-UI-AUDIT-KEY\\n-----END OPENSSH PRIVATE KEY-----'
+    for (const [l, v] of [['名称', '测试机'], ['IP 地址', '10.0.0.9'], ['端口', '2222'], ['用户名', 'root'], ['密码', 'pw123'], ['私钥', FAKE_KEY]]) {
       const r = await js(`window.__t.fillLabel(${JSON.stringify(l)}, ${JSON.stringify(v)})`)
       if (r !== 'OK') console.log(`       (字段 ${l}: ${r})`)
     }
@@ -183,6 +187,11 @@ async function main() {
     const list = (await api('/servers')).body
     ok(list.length === 1 && list[0].host === '10.0.0.9' && String(list[0].port) === '2222' && list[0].name === '测试机',
       '界面新建后落盘字段正确', JSON.stringify(list))
+    // 私钥落盘回归:后端 getServerConfig 有 privateKey 时用私钥认证;字段丢了=密钥登录的服务器永远连不上。
+    // 直接读数据目录的 servers.json(API 返回同样来自该文件,双保险)
+    const disk = JSON.parse(fs.readFileSync(path.join(dataDir, 'servers.json'), 'utf-8'))
+    ok(disk.length === 1 && disk[0].privateKey === FAKE_KEY, '私钥随服务器记录落盘(servers.json 含 privateKey 且值一致)',
+      `磁盘记录=${JSON.stringify((disk || []).map(x => ({ name: x.name, hasKey: !!x.privateKey })))}`)
     await reload()
   }
 

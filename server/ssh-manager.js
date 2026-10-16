@@ -305,23 +305,47 @@ function getServerConfig(serverId) {
 }
 
 // 确保某服务器的文件连接已建立并返回其 client
+// 并发安全:条目挂 ready Promise,'connecting' 中的并发调用 await 同一次连接而不是
+// 各自 new Client——旧实现里第二个调用会覆盖 Map 条目,第一个 client 的 ready/close
+// 回调随即误标/误删第二个条目,且第一个 client 再无人持有,永久泄漏一条 SSH 连接。
+// 所有事件回调先核对 fileConnections.get(serverId) === entry,防旧连接的迟到回调误伤
+// 新条目(如超时重连后旧 client 才触发 close)。
 export async function ensureFileClient(serverId) {
   const existing = fileConnections.get(serverId)
-  if (existing && existing.status === 'connected') return existing.client
+  if (existing) {
+    if (existing.status === 'connected') return existing.client
+    // 'connecting':等同一次连接出结果——成功则复用;失败则条目已被回调清理,落到下方新建
+    try { await existing.ready } catch { /* 连接失败,落到下方重试 */ }
+    const cur = fileConnections.get(serverId)
+    if (cur && cur.status === 'connected') return cur.client
+  }
   const config = getServerConfig(serverId)
   const client = new Client()
-  fileConnections.set(serverId, { client, status: 'connecting' })
-  await new Promise((resolve, reject) => {
+  const entry = { client, status: 'connecting', ready: null }
+  entry.ready = new Promise((resolve, reject) => {
     client.on('ready', () => {
-      const c = fileConnections.get(serverId)
-      if (c) c.status = 'connected'
+      if (fileConnections.get(serverId) === entry) entry.status = 'connected'
       resolve()
     })
-    client.on('error', (e) => { fileConnections.delete(serverId); fileSftps.delete(serverId); reject(e) })
-    client.on('close', () => { fileConnections.delete(serverId); fileSftps.delete(serverId) })
-    client.on('end', () => { fileConnections.delete(serverId); fileSftps.delete(serverId) })
+    client.on('error', (e) => {
+      if (fileConnections.get(serverId) === entry) { fileConnections.delete(serverId); fileSftps.delete(serverId) }
+      reject(e)
+    })
+    client.on('close', () => {
+      if (fileConnections.get(serverId) === entry) { fileConnections.delete(serverId); fileSftps.delete(serverId) }
+      // 就绪前断开:让 await existing.ready 的并发方失败并走重试;就绪后此调用为无操作
+      reject(new Error('文件连接未就绪即断开'))
+    })
+    client.on('end', () => {
+      if (fileConnections.get(serverId) === entry) { fileConnections.delete(serverId); fileSftps.delete(serverId) }
+      reject(new Error('文件连接未就绪即断开'))
+    })
     client.connect(config)
   })
+  // 无人 await 时(如连接建立后旧条目回调触发的 reject)不能成为未处理 rejection
+  entry.ready.catch(() => {})
+  fileConnections.set(serverId, entry)
+  await entry.ready
   return client
 }
 

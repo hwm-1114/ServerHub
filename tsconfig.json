@@ -21,11 +21,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
-    "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"]
-    }
+    "forceConsistentCasingInFileNames": true
   },
   // 只检查 src/:不含 server/、scripts/、electron/(原因见文件开头注释,
   // 那三个目录的未定义标识符改由 eslint 的 no-undef 负责)。

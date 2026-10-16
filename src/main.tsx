@@ -1,5 +1,15 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
+// 字体本地化(@fontsource,随包打包):替代 index.html 里的 Google Fonts 外链,
+// 离线/内网环境首屏不再阻塞等外网字体。字重与原外链一致(Inter 400/500/600/700,
+// JetBrains Mono 400/500/600);中文仍按 CSS 字体栈回退系统字体,行为与之前相同。
+import '@fontsource/inter/400.css'
+import '@fontsource/inter/500.css'
+import '@fontsource/inter/600.css'
+import '@fontsource/inter/700.css'
+import '@fontsource/jetbrains-mono/400.css'
+import '@fontsource/jetbrains-mono/500.css'
+import '@fontsource/jetbrains-mono/600.css'
 import App from './App'
 import './index.css'
 import './skins.css'

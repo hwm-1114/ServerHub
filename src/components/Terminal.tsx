@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -14,7 +14,8 @@ interface Props {
   isConnected: boolean
   /** 当前是否为可见(激活)会话:不可见时保持挂载、WS 不断,仅用 CSS 显隐 */
   active: boolean
-  onConnect: () => void
+  /** 连接该会话所属服务器(收 serverId,与 onActivity 同风格,便于 App 传稳定引用配合 memo) */
+  onConnect: (serverId: string) => void
   /** 会话在后台(非激活)收到输出时回调,用于标签页提醒 */
   onActivity?: (sessionId: string) => void
   /** 打开《文件》界面并定位到当前会话所在目录 */
@@ -40,7 +41,9 @@ function encodeInputBase64(text: string): string {
   return btoa(bin)
 }
 
-export function Terminal({ session, serverName, isConnected, active, onConnect, onActivity, onOpenFilesAtSession }: Props) {
+// memo 化:终端实例常驻挂载,props 全部稳定化(App 侧 useCallback)后,
+// 5s 状态轮询引发的 App 重渲染不再传导到每个终端
+export const Terminal = memo(function Terminal({ session, serverName, isConnected, active, onConnect, onActivity, onOpenFilesAtSession }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<XTerm | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -462,7 +465,7 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
               <Plug size={24} className="text-slate-500" />
             </div>
             <p className="text-sm text-slate-400 mb-3">服务器未连接</p>
-            <button onClick={onConnect} className="btn-primary">
+            <button onClick={() => onConnect(session.serverId)} className="btn-primary">
               <Plug size={15} /> 连接服务器
             </button>
           </div>
@@ -538,4 +541,4 @@ export function Terminal({ session, serverName, isConnected, active, onConnect, 
       )}
     </div>
   )
-}
+})

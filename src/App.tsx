@@ -11,6 +11,7 @@ import { getTerminalContent } from './lib/TerminalBridge'
 import { SkinPicker } from './components/SkinPicker'
 import { SKIN_STORAGE_KEY, DEFAULT_SKIN } from './lib/skins'
 import { stripAnsi } from './lib/ansi'
+import { apiFetch } from './lib/api'
 import { Server, ConnectionStatus, Session, LocalFavorite, MAX_SESSIONS_PER_SERVER } from './types'
 import { Terminal as TerminalIcon, FolderTree, Server as ServerIcon, Plus, X, TerminalSquare, Copy, Check, Smartphone, AlertTriangle } from 'lucide-react'
 
@@ -99,8 +100,19 @@ function App() {
   const fetchStatuses = useCallback(async () => {
     try {
       const res = await fetch('/api/servers/status')
-      const statusMap = await res.json()
-      setStatuses(statusMap)
+      const statusMap: unknown = await res.json().catch(() => null)
+      // 响应形状校验(与 fetchServers 同思路):非对象/数组/带 error 字段时丢弃本次结果
+      if (!res.ok || !statusMap || typeof statusMap !== 'object' || Array.isArray(statusMap)) return
+      if ((statusMap as { error?: unknown }).error) return
+      const next = statusMap as Record<string, ConnectionStatus>
+      // 浅比较:键集合与各值都没变时沿用旧对象引用,5s 轮询不再触发整树重渲染
+      // (旧实现每次 setStatuses(新对象),所有常驻 Terminal 每 5s 都跟着白白重渲染)
+      setStatuses(prev => {
+        const prevKeys = Object.keys(prev)
+        const nextKeys = Object.keys(next)
+        if (prevKeys.length === nextKeys.length && nextKeys.every(k => prev[k] === next[k])) return prev
+        return next
+      })
     } catch {
       // 忽略轮询异常,保持上次状态
     }
@@ -136,8 +148,20 @@ function App() {
   }, [fetchLocalFavorites])
 
   // ========== 会话逻辑 ==========
-  // 合并某服务器最新会话到本地状态,并确保 active 属于该服务器
+  // loadSessions 竞态防护:同一服务器的加载请求按序号生效,慢响应若晚于新请求返回
+  // 直接丢弃,避免过期列表覆盖新状态(参考 FileBrowser 的 loadSeqRef 模式,按服务器分键)
+  const loadSeqRef = useRef<Record<string, number>>({})
+  // 活跃会话归属判断需要最新 sessions 快照(setActiveSessionId 的 updater 里拿不到)
+  const sessionsRef = useRef<Session[]>([])
+  useEffect(() => { sessionsRef.current = sessions }, [sessions])
+
+  // 合并某服务器最新会话到本地状态。
+  // active 只在"原来为空"或"原活跃会话属于本服务器且已不在新列表里"时才改;
+  // 活跃会话属于其它服务器时保持不变——否则在 B 终端干活时点 A 的连接按钮,
+  // loadSessions(A) 会把焦点强切到 A 的首个会话(焦点被偷)。
   const loadSessions = useCallback(async (serverId: string, preferAutoCreate: boolean) => {
+    const seq = (loadSeqRef.current[serverId] ?? 0) + 1
+    loadSeqRef.current[serverId] = seq
     const res = await fetch(`/api/servers/${serverId}/sessions`)
     let list: Session[] = await res.json().catch(() => null)
     // 非数组(错误体)时不能往下走:[...prev, ...list] 会抛 "list is not iterable" → 白屏
@@ -145,20 +169,54 @@ function App() {
       setBootError(`无法加载该服务器的会话列表(HTTP ${res.status})`)
       return
     }
+    if (loadSeqRef.current[serverId] !== seq) return // 已有更新的同服务器请求,丢弃过期响应
     if (preferAutoCreate && list.length === 0) {
       const created = await fetch(`/api/servers/${serverId}/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
       })
-      const s = await created.json()
-      list = [s]
+      const s = await created.json().catch(() => null)
+      if (loadSeqRef.current[serverId] !== seq) return
+      // 自动创建失败(如满员):按空列表处理,不把 {error} 错误体当会话塞进状态
+      if (created.ok && s && s.id) list = [s]
     }
     setSessions(prev => [...prev.filter(x => x.serverId !== serverId), ...list])
     setActiveSessionId(prev => {
-      const belongs = list.some(s => s.id === prev)
-      return belongs ? prev : (list[0]?.id ?? null)
+      if (prev === null) return list[0]?.id ?? null
+      if (list.some(s => s.id === prev)) return prev
+      // prev 属于其它服务器:保持不变,不抢焦点
+      const prevSession = sessionsRef.current.find(x => x.id === prev)
+      if (prevSession && prevSession.serverId !== serverId) return prev
+      // prev 属于本服务器的旧会话且已不存在:回退到本服务器首个会话
+      return list[0]?.id ?? null
     })
+  }, [])
+
+  // 连接/断开。声明位置提前:下方 handleOpenFilesAtSession 等 useCallback 依赖其稳定引用
+  const handleConnect = useCallback(async (serverId: string) => {
+    setStatuses(prev => ({ ...prev, [serverId]: 'connecting' }))
+    try {
+      const res = await fetch(`/api/servers/${serverId}/connect`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error)
+      setStatuses(prev => ({ ...prev, [serverId]: 'connected' }))
+      // 已连接但没有会话时自动补一个默认会话
+      await loadSessions(serverId, true)
+    } catch (err) {
+      setStatuses(prev => ({ ...prev, [serverId]: 'disconnected' }))
+      alert(`连接失败: ${err instanceof Error ? err.message : '未知错误'}`)
+    }
+  }, [loadSessions])
+
+  const handleDisconnect = useCallback(async (serverId: string) => {
+    try {
+      // 先校验响应,成功后才改本地状态(旧实现不查响应,失败也照样显示"断开")
+      await apiFetch(`/api/servers/${serverId}/disconnect`, { method: 'POST' })
+      setStatuses(prev => ({ ...prev, [serverId]: 'disconnected' }))
+    } catch (err) {
+      alert(`断开连接失败: ${err instanceof Error ? err.message : '未知错误'}`)
+    }
   }, [])
 
   // 选中服务器:加载其会话(不自动创建,让用户决定);切换 active 到该服务器首个会话
@@ -252,7 +310,8 @@ function App() {
   }
 
   // 终端会话「在当前目录打开文件」:读取该会话当前目录,切到文件页并定位
-  const handleOpenFilesAtSession = async (s: Session) => {
+  // useCallback 化:作为常驻 Terminal 的 props,需保持引用稳定(5s 状态轮询不重建)
+  const handleOpenFilesAtSession = useCallback(async (s: Session) => {
     if (statuses[s.serverId] !== 'connected') await handleConnect(s.serverId)
     try {
       const res = await fetch(`/api/servers/${s.serverId}/sessions/${s.id}/cwd`)
@@ -261,7 +320,7 @@ function App() {
     } catch {}
     // 即使拿不到 cwd 也切到文件页(停在默认目录)
     setActiveTab('files')
-  }
+  }, [statuses, handleConnect])
 
   const handleRenameSession = async (s: Session, name: string) => {
     try {
@@ -316,7 +375,13 @@ function App() {
   }
 
   const handleDeleteSession = async (s: Session) => {
-    await fetch(`/api/servers/${s.serverId}/sessions/${s.id}`, { method: 'DELETE' })
+    try {
+      // 先校验响应,成功后才改本地状态(旧实现失败也照样删,刷新后会话"复活")
+      await apiFetch(`/api/servers/${s.serverId}/sessions/${s.id}`, { method: 'DELETE' })
+    } catch (err) {
+      alert(`删除会话失败: ${err instanceof Error ? err.message : '未知错误'}`)
+      return
+    }
     const remaining = sessions.filter(x => x.serverId === s.serverId && x.id !== s.id)
     setSessions(prev => prev.filter(x => x.id !== s.id))
     if (activeSessionId === s.id) {
@@ -436,49 +501,45 @@ function App() {
   }
 
   // ========== 服务器与常规交互 ==========
-  const handleConnect = async (serverId: string) => {
-    setStatuses(prev => ({ ...prev, [serverId]: 'connecting' }))
-    try {
-      const res = await fetch(`/api/servers/${serverId}/connect`, { method: 'POST' })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error)
-      setStatuses(prev => ({ ...prev, [serverId]: 'connected' }))
-      // 已连接但没有会话时自动补一个默认会话
-      await loadSessions(serverId, true)
-    } catch (err) {
-      setStatuses(prev => ({ ...prev, [serverId]: 'disconnected' }))
-      alert(`连接失败: ${err instanceof Error ? err.message : '未知错误'}`)
-    }
-  }
-
-  const handleDisconnect = async (serverId: string) => {
-    await fetch(`/api/servers/${serverId}/disconnect`, { method: 'POST' })
-    setStatuses(prev => ({ ...prev, [serverId]: 'disconnected' }))
-  }
-
   const handleSaveServer = async (server: Server) => {
-    if (editingServer) {
-      await fetch(`/api/servers/${server.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      })
-      // 编辑可能改了 host/端口/密码:断开旧连接,让新配置下次生效
-      await handleDisconnect(server.id)
-    } else {
-      await fetch('/api/servers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      })
+    let saved: Server
+    try {
+      // apiFetch:非 2xx 或带 error 字段即抛错(旧实现不查响应,保存失败完全静默)
+      if (editingServer) {
+        saved = await apiFetch<Server>(`/api/servers/${server.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(server),
+        })
+      } else {
+        saved = await apiFetch<Server>('/api/servers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(server),
+        })
+      }
+    } catch (err) {
+      alert(`保存服务器失败: ${err instanceof Error ? err.message : '未知错误'}`)
+      return
     }
-    await fetchServers()
+    // 用后端返回的对象更新本地 state(带后端生成的 id/privateKey/createdAt 等字段)
+    setServers(prev => editingServer ? prev.map(x => (x.id === saved.id ? saved : x)) : [...prev, saved])
+    if (editingServer) {
+      // 编辑可能改了 host/端口/密码:断开旧连接,让新配置下次生效
+      await handleDisconnect(saved.id)
+    }
     setShowModal(false)
     setEditingServer(null)
   }
 
   const handleDeleteServer = async (serverId: string) => {
-    await fetch(`/api/servers/${serverId}`, { method: 'DELETE' })
+    try {
+      // 先校验响应,成功后才改本地状态(旧实现失败也照样移除,刷新后"复活")
+      await apiFetch(`/api/servers/${serverId}`, { method: 'DELETE' })
+    } catch (err) {
+      alert(`删除服务器失败: ${err instanceof Error ? err.message : '未知错误'}`)
+      return
+    }
     // 一并移除该服务器的会话与激活状态
     setSessions(prev => prev.filter(s => s.serverId !== serverId))
     if (selectedServerId === serverId) setSelectedServerId(null)
@@ -830,7 +891,7 @@ function App() {
                           serverName={servers.find(x => x.id === s.serverId)?.name || s.serverId}
                           isConnected={statuses[s.serverId] === 'connected'}
                           active={visible}
-                          onConnect={() => handleConnect(s.serverId)}
+                          onConnect={handleConnect}
                           onActivity={handleSessionActivity}
                           onOpenFilesAtSession={handleOpenFilesAtSession}
                         />

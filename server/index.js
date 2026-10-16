@@ -67,7 +67,10 @@ app.use('/api', (req, res, next) => {
 // 否则上传 Content-Type 为 application/json 的文件(如 .json)时,json 解析器会把请求体
 // 读空,导致下拉到文件的 req 流已耗尽,最终远端落盘 0 字节。故凡路径含 /files/upload 的
 // 请求一律跳过 json 解析,让原始 body 原样流向 SFTP 写入流。
-const jsonParser = express.json()
+// limit 1mb:body-parser 默认上限仅 100kb,而"在线编辑保存"路由允许 512KB、命令集导入
+// 也可能超 100KB,默认上限会把这些合法请求 413 截杀(且返回 HTML 错误页);1mb 覆盖
+// 512KB 正文 + 导入余量。
+const jsonParser = express.json({ limit: '1mb' })
 app.use((req, res, next) => {
   if (req.originalUrl.includes('/files/upload')) return next()
   return jsonParser(req, res, next)
@@ -101,7 +104,7 @@ app.get('/api/servers', (req, res) => {
 })
 
 app.post('/api/servers', async (req, res) => {
-  const { name, host, port, username, password } = req.body
+  const { name, host, port, username, password, privateKey } = req.body
   if (!host || !username) {
     return res.status(400).json({ error: '缺少必填字段' })
   }
@@ -114,13 +117,16 @@ app.post('/api/servers', async (req, res) => {
     password: password || '',
     createdAt: new Date().toISOString(),
   }
+  // 私钥认证:非空才落盘(空串视为未填,即密码认证;连接时 getServerConfig/openTerminalConn
+  // 读到 privateKey 会自动忽略密码改用密钥认证)
+  if (privateKey) newServer.privateKey = privateKey
   await mutateServers(list => { list.push(newServer); return list })
   res.status(201).json(newServer)
 })
 
 app.put('/api/servers/:id', async (req, res) => {
   const { id } = req.params
-  const { name, host, port, username, password } = req.body
+  const { name, host, port, username, password, privateKey } = req.body
   try {
     await mutateServers(list => {
       const idx = list.findIndex(s => s.id === id)
@@ -132,6 +138,11 @@ app.put('/api/servers/:id', async (req, res) => {
       if (username !== undefined) u.username = username
       // 密码明文直接写入(本地/内网工具,刻意设计)
       if (password !== undefined) u.password = password
+      // 私钥:非空则覆盖;显式传空串 = 删除私钥、回到密码认证(与前端 ServerModal 说明一致)
+      if (privateKey !== undefined) {
+        if (privateKey) u.privateKey = privateKey
+        else delete u.privateKey
+      }
       list[idx] = u
       return list
     })
@@ -255,9 +266,40 @@ app.get('/api/servers/:id/files/download', async (req, res) => {
       }
       // stat 失败但不是"不存在"(如权限受限)时保持旧行为:不带长度直接流式试一次
       const rs = sftp.createReadStream(remotePath)
+      // 中止清理 + 看护超时(与 runTransfer / /files/upload 用同一套阈值
+      // TRANSFER_IDLE_TIMEOUT / TRANSFER_TOTAL_TIMEOUT,只是把"清理半成品"换成
+      // "销毁读流"——下载不写远端,没有半成品要删):
+      //  - 浏览器取消下载时只有 res 'close',SFTP 读流不会自行结束,旧实现让它永久
+      //    残留占住一条 SFTP 通道,故 res 'close' 时未正常结束就 rs.destroy();
+      //  - 半开链路下 close/error 都可能不来,加与上传对称的"空闲 60s / 总 30min"
+      //    兜底:超时 destroy 流并断开响应(响应头可能已发,不能再回 JSON)。
+      let lastActivity = Date.now()
+      const started = lastActivity
+      let finished = false // 数据全部交给响应(rs 'end' / res 'finish')或错误路径已处理
+      let timer = null
+      const stopTimer = () => { if (timer) { clearInterval(timer); timer = null } }
+      timer = setInterval(() => {
+        const now = Date.now()
+        if (now - lastActivity > TRANSFER_IDLE_TIMEOUT || now - started > TRANSFER_TOTAL_TIMEOUT) {
+          console.error(`[download] 看护中止:${remotePath} ${now - lastActivity > TRANSFER_IDLE_TIMEOUT ? '空闲超时' : '总时长超时'}`)
+          stopTimer()
+          try { rs.destroy() } catch { /* 已结束 */ }
+          res.destroy()
+        }
+      }, 1000)
+      rs.on('data', () => { lastActivity = Date.now() })
       rs.on('error', (e) => {
+        finished = true // 错误已在此处理,res 'close' 不再重复销毁
+        stopTimer()
         if (!res.headersSent) res.status(500).json({ error: sftpErrText(e) })
         res.destroy()
+      })
+      rs.on('end', () => { finished = true })
+      res.on('finish', () => { finished = true; stopTimer() })
+      // 'close' 正常结束与客户端中止都会触发:只在未正常结束时销毁读流
+      res.on('close', () => {
+        stopTimer()
+        if (!finished) { try { rs.destroy() } catch { /* 已结束 */ } }
       })
       rs.pipe(res)
     })
